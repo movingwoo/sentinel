@@ -1,0 +1,18 @@
+# Installed as /etc/sentinel/sentinel.conf with mode 0600.
+# Keep the bot token out of this file; it belongs in telegram-token.
+TELEGRAM_CHAT_ID=
+
+# The defaults below match the Osaka A1.Flex instance and normally need no change.
+# TOTAL_VCPUS=2
+# SAMPLE_SECONDS=10
+# CPU_THRESHOLD=30
+# ALERT_AFTER_FAILURES=2
+# REMINDER_HOURS=12
+
+# Optional advanced settings and their defaults.
+# STATE_FILE=/var/lib/sentinel/state.json
+# BOINC_SERVICE=boinc-client.service
+# BOINCCMD=/usr/bin/boinccmd
+# BOINC_DATA_DIR=/var/lib/boinc-client
+# CGROUP_ROOT=/sys/fs/cgroup
+# COMMAND_TIMEOUT=8

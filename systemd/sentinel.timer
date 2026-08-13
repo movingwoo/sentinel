@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Sentinel every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+AccuracySec=1s
+Unit=sentinel.service
+
+[Install]
+WantedBy=timers.target
