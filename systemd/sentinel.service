@@ -19,9 +19,14 @@ Environment=SAMPLE_SECONDS=10
 Environment=CPU_THRESHOLD=30
 Environment=ALERT_AFTER_FAILURES=2
 Environment=REMINDER_HOURS=12
+Environment=RECOVER_ENABLED=1
+Environment=RECOVER_AFTER_FAILURES=1
+Environment=RECOVER_COOLDOWN_HOURS=6
+Environment=RECOVER_MAX_PER_INCIDENT=2
+Environment=RECOVER_TIMEOUT=45
 EnvironmentFile=-/etc/sentinel/sentinel.conf
 LoadCredential=telegram-token:/etc/sentinel/telegram-token
-TimeoutStartSec=2min
+TimeoutStartSec=4min
 
 NoNewPrivileges=yes
 PrivateTmp=yes

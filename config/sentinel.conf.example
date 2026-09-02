@@ -9,6 +9,18 @@ TELEGRAM_CHAT_ID=
 # ALERT_AFTER_FAILURES=2
 # REMINDER_HOURS=12
 
+# Auto-recovery. On a work shortage Sentinel runs `boinccmd --acct_mgr sync`
+# to make the account manager hand out projects again. That call is destructive:
+# the manager may reply <detach/>, which BOINC acts on immediately and which
+# discards whatever the detached project had in flight. The cooldown is what
+# keeps one detach from cascading into the next check's failure, so lower it
+# with care and set RECOVER_ENABLED=0 to turn the whole thing off.
+# RECOVER_ENABLED=1
+# RECOVER_AFTER_FAILURES=1
+# RECOVER_COOLDOWN_HOURS=6
+# RECOVER_MAX_PER_INCIDENT=2
+# RECOVER_TIMEOUT=45
+
 # Optional advanced settings and their defaults.
 # STATE_FILE=/var/lib/sentinel/state.json
 # BOINC_SERVICE=boinc-client.service

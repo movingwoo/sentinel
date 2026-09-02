@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 KST = timezone(timedelta(hours=9), name="KST")
 LOGGER = logging.getLogger("sentinel")
 EXECUTING_RE = re.compile(r"^\s*active_task_state\s*:\s*EXECUTING\s*$", re.MULTILINE)
@@ -83,6 +83,10 @@ def weekly_due(value: datetime) -> datetime:
     return monday.astimezone(timezone.utc)
 
 
+def _env_flag(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
 def read_boot_id(path: Path = Path("/proc/sys/kernel/random/boot_id")) -> str:
     return path.read_text(encoding="ascii").strip()
 
@@ -103,6 +107,9 @@ def default_state(boot_id: str, now: datetime) -> dict[str, Any]:
         "last_alert_at": None,
         "last_check": None,
         "pending_recovery": None,
+        "pending_recovery_alert": None,
+        "last_recovery_at": None,
+        "recoveries_this_incident": 0,
         "pending_state_reset_alert": None,
         "current_week": _counter_block(week_key(now)),
         "pending_weekly": None,
@@ -141,6 +148,9 @@ def validate_state(state: Any) -> dict[str, Any]:
         "last_alert_at",
         "last_check",
         "pending_recovery",
+        "pending_recovery_alert",
+        "last_recovery_at",
+        "recoveries_this_incident",
         "pending_state_reset_alert",
         "current_week",
         "pending_weekly",
@@ -203,6 +213,21 @@ def validate_state(state: Any) -> dict[str, Any]:
         for key in ("backup_name", "error_type"):
             if not isinstance(reset.get(key), str) or not reset[key]:
                 raise InvalidStateError(f"pending_state_reset_alert.{key} is invalid")
+    if not _is_nonnegative_int(state["recoveries_this_incident"]):
+        raise InvalidStateError("recoveries_this_incident is invalid")
+    parse_utc(state["last_recovery_at"])
+    if state["pending_recovery_alert"] is not None:
+        attempt = state["pending_recovery_alert"]
+        if not isinstance(attempt, dict):
+            raise InvalidStateError("pending_recovery_alert is invalid")
+        required_utc(attempt.get("attempted_at"), "pending_recovery_alert.attempted_at")
+        for key in ("attempt", "max_attempts"):
+            if not _is_nonnegative_int(attempt.get(key)):
+                raise InvalidStateError(f"pending_recovery_alert.{key} is invalid")
+        if not isinstance(attempt.get("succeeded"), bool):
+            raise InvalidStateError("pending_recovery_alert.succeeded is invalid")
+        if not isinstance(attempt.get("detail"), str):
+            raise InvalidStateError("pending_recovery_alert.detail is invalid")
     _validate_counter(state["current_week"])
     if state["pending_weekly"] is not None:
         _validate_counter(state["pending_weekly"], pending=True)
@@ -221,6 +246,16 @@ def migrate_state(raw: Any, boot_id: str, now: datetime) -> dict[str, Any]:
         )
     if version == SCHEMA_VERSION:
         return validate_state(raw)
+
+    if version == 1:
+        # Schema 2 only adds auto-recovery bookkeeping, so every schema 1 field
+        # carries over untouched and the cooldown simply starts unarmed.
+        upgraded = dict(raw)
+        upgraded["schema_version"] = SCHEMA_VERSION
+        upgraded.setdefault("pending_recovery_alert", None)
+        upgraded.setdefault("last_recovery_at", None)
+        upgraded.setdefault("recoveries_this_incident", 0)
+        return validate_state(upgraded)
 
     # Schema 0 was the pre-release flat-counter format. Preserve every compatible
     # field, while initializing notification bookkeeping introduced in v1.
@@ -364,6 +399,15 @@ class CheckResult:
     def healthy(self, threshold: float) -> bool:
         return not self.reasons(threshold)
 
+    def starved(self) -> bool:
+        """True when BOINC is alive and measurable but has no task to run.
+
+        This is the only failure signature an account manager sync can fix. A
+        dead service needs a restart and a probe error means the measurement
+        itself is untrustworthy, so both must not trigger recovery.
+        """
+        return self.service_active and not self.errors and self.executing_tasks == 0
+
 
 @dataclass
 class Settings:
@@ -380,6 +424,11 @@ class Settings:
     telegram_chat_id: str = ""
     telegram_token_file: Optional[Path] = None
     command_timeout: float = 8.0
+    recover_enabled: bool = True
+    recover_after_failures: int = 1
+    recover_cooldown_hours: float = 6.0
+    recover_max_per_incident: int = 2
+    recover_timeout: float = 45.0
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -403,6 +452,11 @@ class Settings:
             telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", "").strip(),
             telegram_token_file=token_file,
             command_timeout=float(os.environ.get("COMMAND_TIMEOUT", "8")),
+            recover_enabled=_env_flag("RECOVER_ENABLED", "1"),
+            recover_after_failures=int(os.environ.get("RECOVER_AFTER_FAILURES", "1")),
+            recover_cooldown_hours=float(os.environ.get("RECOVER_COOLDOWN_HOURS", "6")),
+            recover_max_per_incident=int(os.environ.get("RECOVER_MAX_PER_INCIDENT", "2")),
+            recover_timeout=float(os.environ.get("RECOVER_TIMEOUT", "45")),
         )
 
     def validate(self) -> None:
@@ -418,6 +472,14 @@ class Settings:
             raise ValueError("REMINDER_HOURS must be positive")
         if not math.isfinite(self.command_timeout) or self.command_timeout <= 0:
             raise ValueError("COMMAND_TIMEOUT must be positive")
+        if self.recover_after_failures < 1:
+            raise ValueError("RECOVER_AFTER_FAILURES must be at least 1")
+        if self.recover_max_per_incident < 1:
+            raise ValueError("RECOVER_MAX_PER_INCIDENT must be at least 1")
+        if not math.isfinite(self.recover_cooldown_hours) or self.recover_cooldown_hours <= 0:
+            raise ValueError("RECOVER_COOLDOWN_HOURS must be positive")
+        if not math.isfinite(self.recover_timeout) or self.recover_timeout <= 0:
+            raise ValueError("RECOVER_TIMEOUT must be positive")
 
 
 class BoincProbe:
@@ -537,6 +599,43 @@ class BoincProbe:
         return CheckResult(active, tasks, round(cpu_percent, 2), errors)
 
 
+class RecoveryRunner:
+    """Ask the account manager for a fresh project assignment.
+
+    This is a destructive call, not a query. The manager may answer with
+    <detach/>, and client/acct_mgr.cpp acts on it through detach_project()
+    immediately, discarding whatever the detached project had in flight. Only
+    call it through recovery_block_reason(), which enforces the cooldown that
+    keeps a detach from cascading into the next check's failure.
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    ):
+        self.settings = settings
+        self.runner = runner
+
+    def run(self) -> tuple[bool, str]:
+        args = [self.settings.boinccmd, "--acct_mgr", "sync"]
+        try:
+            result = self.runner(
+                args,
+                cwd=str(self.settings.boinc_data_dir),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=self.settings.recover_timeout,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, f"acct_mgr sync {type(exc).__name__}"
+        if result.returncode != 0:
+            return False, f"acct_mgr sync exit {result.returncode}"
+        return True, "acct_mgr sync ok"
+
+
 class TelegramNotifier:
     def __init__(self, chat_id: str, token_file: Optional[Path], timeout: float = 10.0):
         self.chat_id = chat_id
@@ -606,6 +705,7 @@ def handle_boot_change(state: dict[str, Any], boot_id: str) -> bool:
     previous = state["boot_id"]
     state["boot_id"] = boot_id
     state["consecutive_failures"] = 0
+    state["recoveries_this_incident"] = 0
     LOGGER.info("boot ID changed previous=%s current=%s failure_streak_reset=true", previous, boot_id)
     return True
 
@@ -631,6 +731,7 @@ def apply_check(state: dict[str, Any], result: CheckResult, now: datetime, thres
             }
         state["health"] = "healthy"
         state["consecutive_failures"] = 0
+        state["recoveries_this_incident"] = 0
         state["incident_started_at"] = None
         state["incident_confirmed"] = False
         state["incident_alert_sent"] = False
@@ -649,6 +750,42 @@ def apply_check(state: dict[str, Any], result: CheckResult, now: datetime, thres
         counter["incidents"] += 1
     else:
         state["health"] = "degraded"
+
+
+def recovery_block_reason(
+    state: dict[str, Any],
+    result: CheckResult,
+    settings: "Settings",
+    now: datetime,
+) -> Optional[str]:
+    """Return None when auto-recovery may run, otherwise why it must not.
+
+    Ordered cheapest and most decisive first so the journal line names the one
+    condition that actually held the trigger back.
+    """
+    if not settings.recover_enabled:
+        return "disabled"
+    if result.healthy(settings.cpu_threshold):
+        return "check is healthy"
+    if not result.starved():
+        return "failure is not a work shortage"
+    if state["consecutive_failures"] < settings.recover_after_failures:
+        return (
+            f"failure streak {state['consecutive_failures']} "
+            f"< {settings.recover_after_failures}"
+        )
+    if state["recoveries_this_incident"] >= settings.recover_max_per_incident:
+        return (
+            f"incident budget spent "
+            f"{state['recoveries_this_incident']}/{settings.recover_max_per_incident}"
+        )
+    last = parse_utc(state["last_recovery_at"])
+    if last is not None:
+        cooldown = timedelta(hours=settings.recover_cooldown_hours)
+        if now - last < cooldown:
+            remaining = (cooldown - (now - last)).total_seconds() / 3600
+            return f"cooldown for another {remaining:.1f}h"
+    return None
 
 
 def _health_label(value: str) -> str:
@@ -703,6 +840,19 @@ def pending_notifications(
             )
         )
 
+    attempt = state["pending_recovery_alert"]
+    if attempt is not None:
+        outcome = "성공" if attempt["succeeded"] else "실패"
+        notifications.append(
+            Notification(
+                "recovery_attempt",
+                f"🔧 Sentinel 자동복구 {outcome}: {hostname}에서 "
+                f"boinccmd --acct_mgr sync 실행 "
+                f"({attempt['attempt']}/{attempt['max_attempts']}회차, "
+                f"{attempt['detail']}); {_last_check_summary(state)}",
+            )
+        )
+
     if state["incident_confirmed"]:
         last_alert = parse_utc(state["last_alert_at"])
         due = not state["incident_alert_sent"]
@@ -741,6 +891,8 @@ def mark_notification_sent(state: dict[str, Any], notification: Notification, no
         state["pending_state_reset_alert"] = None
     elif notification.kind == "recovery":
         state["pending_recovery"] = None
+    elif notification.kind == "recovery_attempt":
+        state["pending_recovery_alert"] = None
     elif notification.kind in {"incident", "reminder"}:
         state["incident_alert_sent"] = True
         state["last_alert_at"] = utc_text(now)
@@ -757,6 +909,7 @@ class Sentinel:
         notifier: TelegramNotifier,
         hostname: str,
         boot_id_reader: Callable[[], str] = read_boot_id,
+        recovery: Optional[RecoveryRunner] = None,
     ):
         self.settings = settings
         self.store = store
@@ -764,6 +917,33 @@ class Sentinel:
         self.notifier = notifier
         self.hostname = hostname
         self.boot_id_reader = boot_id_reader
+        self.recovery = recovery if recovery is not None else RecoveryRunner(settings)
+
+    def _attempt_recovery(self, state: dict[str, Any], now: datetime) -> None:
+        # Write-ahead. The cooldown is burned and committed before the command
+        # runs, so a crash or a kill mid-sync still costs one attempt rather
+        # than leaving the next check free to detach projects all over again.
+        state["last_recovery_at"] = utc_text(now)
+        state["recoveries_this_incident"] += 1
+        attempt = state["recoveries_this_incident"]
+        self.store.save(state)
+
+        succeeded, detail = self.recovery.run()
+        LOGGER.warning(
+            "auto-recovery ran attempt=%d/%d succeeded=%s detail=%s",
+            attempt,
+            self.settings.recover_max_per_incident,
+            succeeded,
+            detail,
+        )
+        state["pending_recovery_alert"] = {
+            "attempted_at": utc_text(now),
+            "attempt": attempt,
+            "max_attempts": self.settings.recover_max_per_incident,
+            "succeeded": succeeded,
+            "detail": detail,
+        }
+        self.store.save(state)
 
     def check(self, now: Optional[datetime] = None) -> int:
         now = now or utc_now()
@@ -795,6 +975,13 @@ class Sentinel:
         # Commit the observation before attempting external side effects. Each
         # successful notification is then committed separately for retry safety.
         self.store.save(state)
+
+        blocked = recovery_block_reason(state, result, self.settings, now)
+        if blocked is None:
+            self._attempt_recovery(state, now)
+        elif not result.healthy(self.settings.cpu_threshold):
+            LOGGER.info("auto-recovery not run: %s", blocked)
+
         for notification in pending_notifications(
             state, now, self.hostname, self.settings.reminder_hours
         ):
@@ -814,6 +1001,7 @@ def build_sentinel(settings: Settings) -> Sentinel:
         probe=BoincProbe(settings),
         notifier=TelegramNotifier(settings.telegram_chat_id, settings.telegram_token_file),
         hostname=socket.gethostname(),
+        recovery=RecoveryRunner(settings),
     )
 
 

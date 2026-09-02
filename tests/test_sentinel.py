@@ -70,7 +70,7 @@ class StateTests(unittest.TestCase):
             "incidents": 1,
         }
         state = rg.migrate_state(raw, "new-boot", at("2026-08-10T00:00:00Z"))
-        self.assertEqual(state["schema_version"], 1)
+        self.assertEqual(state["schema_version"], rg.SCHEMA_VERSION)
         self.assertEqual(state["current_week"]["checks"], 100)
         self.assertEqual(state["current_week"]["incidents"], 1)
 
@@ -274,6 +274,262 @@ class UnitTests(unittest.TestCase):
         self.assertIn("Group=root\n", unit)
         self.assertIn("SupplementaryGroups=boinc\n", unit)
         self.assertIn("StateDirectory=sentinel\n", unit)
+
+
+class FakeRecovery:
+    def __init__(self, result=(True, "acct_mgr sync ok"), error=None):
+        self.result = result
+        self.error = error
+        self.calls = 0
+
+    def run(self):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+def recovery_settings(**overrides):
+    return rg.Settings(**overrides)
+
+
+class RecoveryGateTests(unittest.TestCase):
+    def setUp(self):
+        self.now = at("2026-09-01T12:00:00Z")
+        self.state = rg.default_state("boot", self.now)
+        self.state["consecutive_failures"] = 1
+        self.settings = recovery_settings()
+
+    def block(self, result, **overrides):
+        settings = recovery_settings(**overrides) if overrides else self.settings
+        return rg.recovery_block_reason(self.state, result, settings, self.now)
+
+    def test_starved_failure_passes_the_gate_on_the_first_failure(self):
+        self.assertIsNone(self.block(rg.CheckResult(True, 0, 0.0)))
+
+    def test_healthy_check_never_triggers(self):
+        self.assertEqual(self.block(rg.CheckResult(True, 1, 50.0)), "check is healthy")
+
+    def test_dead_service_is_not_a_work_shortage(self):
+        self.assertEqual(
+            self.block(rg.CheckResult(False, 0, 0.0)), "failure is not a work shortage"
+        )
+
+    def test_probe_error_is_not_a_work_shortage(self):
+        result = rg.CheckResult(True, 0, 0.0, ["task query PermissionError"])
+        self.assertEqual(self.block(result), "failure is not a work shortage")
+
+    def test_running_task_with_low_cpu_is_not_a_work_shortage(self):
+        self.assertEqual(
+            self.block(rg.CheckResult(True, 2, 5.0)), "failure is not a work shortage"
+        )
+
+    def test_disabled_switch_wins(self):
+        self.assertEqual(
+            self.block(rg.CheckResult(True, 0, 0.0), recover_enabled=False), "disabled"
+        )
+
+    def test_streak_shorter_than_threshold_waits(self):
+        reason = self.block(rg.CheckResult(True, 0, 0.0), recover_after_failures=2)
+        self.assertEqual(reason, "failure streak 1 < 2")
+
+    def test_incident_budget_is_capped(self):
+        self.state["recoveries_this_incident"] = 2
+        self.assertEqual(
+            self.block(rg.CheckResult(True, 0, 0.0)), "incident budget spent 2/2"
+        )
+
+    def test_cooldown_blocks_and_then_expires(self):
+        self.state["last_recovery_at"] = rg.utc_text(self.now - timedelta(hours=2))
+        reason = self.block(rg.CheckResult(True, 0, 0.0))
+        self.assertIsNotNone(reason)
+        self.assertTrue(reason.startswith("cooldown for another 4.0h"), reason)
+
+        self.state["last_recovery_at"] = rg.utc_text(self.now - timedelta(hours=6, minutes=1))
+        self.assertIsNone(self.block(rg.CheckResult(True, 0, 0.0)))
+
+
+class RecoveryRunnerTests(unittest.TestCase):
+    def test_sync_runs_in_the_boinc_data_dir_so_boinccmd_finds_the_rpc_password(self):
+        seen = {}
+
+        def runner(args, **kwargs):
+            seen["args"] = args
+            seen["cwd"] = kwargs["cwd"]
+            seen["timeout"] = kwargs["timeout"]
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        settings = rg.Settings(boinc_data_dir=Path("/var/lib/boinc-client"), recover_timeout=45)
+        succeeded, detail = rg.RecoveryRunner(settings, runner=runner).run()
+
+        self.assertTrue(succeeded)
+        self.assertEqual(seen["args"], ["/usr/bin/boinccmd", "--acct_mgr", "sync"])
+        self.assertEqual(seen["cwd"], "/var/lib/boinc-client")
+        self.assertEqual(seen["timeout"], 45)
+        self.assertEqual(detail, "acct_mgr sync ok")
+
+    def test_nonzero_exit_and_timeout_are_reported_not_raised(self):
+        def failing(args, **kwargs):
+            return subprocess.CompletedProcess(args, 1, "", "boom")
+
+        succeeded, detail = rg.RecoveryRunner(rg.Settings(), runner=failing).run()
+        self.assertFalse(succeeded)
+        self.assertEqual(detail, "acct_mgr sync exit 1")
+
+        def timing_out(args, **kwargs):
+            raise subprocess.TimeoutExpired(args, 45)
+
+        succeeded, detail = rg.RecoveryRunner(rg.Settings(), runner=timing_out).run()
+        self.assertFalse(succeeded)
+        self.assertEqual(detail, "acct_mgr sync TimeoutExpired")
+
+
+class RecoveryIntegrationTests(unittest.TestCase):
+    def build(self, path, probe_result, recovery, **overrides):
+        settings = rg.Settings(state_file=path, **overrides)
+        notifier = FakeNotifier(True)
+        sentinel = rg.Sentinel(
+            settings,
+            rg.StateStore(path),
+            FakeProbe(probe_result),
+            notifier,
+            "host",
+            boot_id_reader=lambda: "boot",
+            recovery=recovery,
+        )
+        return sentinel, notifier
+
+    def test_starvation_syncs_once_then_the_cooldown_holds_the_line(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            now = at("2026-09-01T12:00:00Z")
+            recovery = FakeRecovery()
+            sentinel, notifier = self.build(path, rg.CheckResult(True, 0, 0.0), recovery)
+
+            sentinel.check(now)
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(recovery.calls, 1)
+            self.assertEqual(persisted["recoveries_this_incident"], 1)
+            self.assertEqual(persisted["last_recovery_at"], rg.utc_text(now))
+            # Delivered, so nothing is left pending for the next check.
+            self.assertIsNone(persisted["pending_recovery_alert"])
+            # Recovery acts on the first failure while the Telegram incident
+            # alert still waits for ALERT_AFTER_FAILURES.
+            self.assertFalse(persisted["incident_confirmed"])
+            self.assertEqual(len(notifier.messages), 1)
+            self.assertIn("자동복구 성공", notifier.messages[0])
+
+            # Every subsequent check inside the cooldown must stay hands-off.
+            for step in range(1, 6):
+                sentinel.check(now + timedelta(minutes=15 * step))
+            self.assertEqual(recovery.calls, 1)
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["recoveries_this_incident"], 1)
+
+    def test_cooldown_expiry_allows_a_second_attempt_then_the_budget_stops_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            now = at("2026-09-01T12:00:00Z")
+            recovery = FakeRecovery()
+            sentinel, _ = self.build(path, rg.CheckResult(True, 0, 0.0), recovery)
+
+            sentinel.check(now)
+            sentinel.check(now + timedelta(hours=7))
+            self.assertEqual(recovery.calls, 2)
+            sentinel.check(now + timedelta(hours=14))
+            self.assertEqual(recovery.calls, 2, "incident budget must cap the attempts")
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["recoveries_this_incident"], 2)
+
+    def test_recovering_resets_the_budget_but_keeps_the_global_cooldown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            now = at("2026-09-01T12:00:00Z")
+            recovery = FakeRecovery()
+            sentinel, _ = self.build(path, rg.CheckResult(True, 0, 0.0), recovery)
+            sentinel.check(now)
+
+            healthy, _ = self.build(path, rg.CheckResult(True, 1, 50.0), recovery)
+            healthy.check(now + timedelta(minutes=15))
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["recoveries_this_incident"], 0)
+            self.assertEqual(persisted["last_recovery_at"], rg.utc_text(now))
+
+            # Flapping back into starvation must not sync again inside the cooldown.
+            sentinel.check(now + timedelta(minutes=30))
+            self.assertEqual(recovery.calls, 1)
+
+    def test_cooldown_is_committed_before_the_sync_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            now = at("2026-09-01T12:00:00Z")
+            recovery = FakeRecovery(error=RuntimeError("killed mid-sync"))
+            sentinel, _ = self.build(path, rg.CheckResult(True, 0, 0.0), recovery)
+
+            with self.assertRaises(RuntimeError):
+                sentinel.check(now)
+
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["last_recovery_at"], rg.utc_text(now))
+            self.assertEqual(persisted["recoveries_this_incident"], 1)
+
+    def test_failed_sync_is_reported_and_still_costs_an_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            now = at("2026-09-01T12:00:00Z")
+            recovery = FakeRecovery(result=(False, "acct_mgr sync exit 1"))
+            sentinel, notifier = self.build(path, rg.CheckResult(True, 0, 0.0), recovery)
+
+            sentinel.check(now)
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["recoveries_this_incident"], 1)
+            self.assertIn("자동복구 실패", notifier.messages[0])
+            self.assertIn("acct_mgr sync exit 1", notifier.messages[0])
+
+    def test_undelivered_recovery_alert_survives_for_the_next_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            now = at("2026-09-01T12:00:00Z")
+            recovery = FakeRecovery()
+            settings = rg.Settings(state_file=path)
+            notifier = FakeNotifier(False)
+            sentinel = rg.Sentinel(
+                settings,
+                rg.StateStore(path),
+                FakeProbe(rg.CheckResult(True, 0, 0.0)),
+                notifier,
+                "host",
+                boot_id_reader=lambda: "boot",
+                recovery=recovery,
+            )
+            sentinel.check(now)
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            self.assertIsNotNone(persisted["pending_recovery_alert"])
+            self.assertEqual(persisted["pending_recovery_alert"]["attempt"], 1)
+
+
+class RecoveryMigrationTests(unittest.TestCase):
+    def test_schema_one_state_gains_recovery_fields_without_losing_history(self):
+        raw = rg.default_state("boot", at("2026-08-10T00:00:00Z"))
+        raw["schema_version"] = 1
+        raw["health"] = "unhealthy"
+        raw["consecutive_failures"] = 99
+        raw["incident_started_at"] = "2026-09-01T08:30:00Z"
+        raw["incident_confirmed"] = True
+        raw["incident_alert_sent"] = True
+        raw["last_alert_at"] = "2026-09-02T08:45:00Z"
+        raw["current_week"].update(checks=265, failures=99, incidents=1)
+        for key in ("pending_recovery_alert", "last_recovery_at", "recoveries_this_incident"):
+            del raw[key]
+
+        state = rg.migrate_state(raw, "boot", at("2026-09-02T09:00:00Z"))
+
+        self.assertEqual(state["schema_version"], rg.SCHEMA_VERSION)
+        self.assertEqual(state["consecutive_failures"], 99)
+        self.assertEqual(state["current_week"]["checks"], 265)
+        self.assertIsNone(state["last_recovery_at"])
+        self.assertIsNone(state["pending_recovery_alert"])
+        self.assertEqual(state["recoveries_this_incident"], 0)
 
 
 if __name__ == "__main__":
