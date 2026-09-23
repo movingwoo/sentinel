@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Sentinel: BOINC or service/process health checks with Telegram alerts."""
+"""Sentinel: BOINC, service/process or Docker health checks with Telegram alerts."""
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
+import http.client
 import json
 import logging
 import math
@@ -27,9 +30,15 @@ KST = timezone(timedelta(hours=9), name="KST")
 LOGGER = logging.getLogger("sentinel")
 EXECUTING_RE = re.compile(r"^\s*active_task_state\s*:\s*EXECUTING\s*$", re.MULTILINE)
 
-MONITORS = ("boinc", "process")
+MONITORS = ("boinc", "process", "docker")
 BOINC_TARGET = "boinc"
-TARGET_KINDS = ("service", "process", "cmdline")
+TARGET_KINDS = ("service", "process", "cmdline", "container")
+MONITOR_KINDS = {"process": ("service", "process", "cmdline"), "docker": ("container",)}
+# Kinds whose restart marker is a counter of supervisor restarts.
+COUNTER_KINDS = ("service", "container")
+CONFIG_FILE = Path("/etc/sentinel/sentinel.conf")
+CONFIG_LINE_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+CONTAINER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 UNIT_NAME_RE = re.compile(r"^[A-Za-z0-9:_.@\\-]+$")
 OTHER_UNIT_TYPES = {
     "automount",
@@ -59,6 +68,10 @@ class FutureSchemaError(StateError):
 
 class InvalidStateError(StateError):
     """Raised when a state file has invalid JSON or structure."""
+
+
+class StateLockedError(StateError):
+    """Raised when another Sentinel process holds the state lock."""
 
 
 class ConfigError(ValueError):
@@ -108,8 +121,36 @@ def weekly_due(value: datetime) -> datetime:
     return monday.astimezone(timezone.utc)
 
 
-def _env_flag(name: str, default: str) -> bool:
-    return os.environ.get(name, default).strip().lower() not in {"", "0", "false", "no", "off"}
+def _env_flag(environ: dict[str, str], name: str, default: str) -> bool:
+    return environ.get(name, default).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def read_config_file(path: Path) -> dict[str, str]:
+    """Parse the KEY=VALUE subset of a systemd EnvironmentFile.
+
+    systemd hands sentinel.conf to the unit through EnvironmentFile=. A shell
+    (`sudo sentinel check-config`) does not, so the file is read here too;
+    real environment variables still win, exactly as they do under systemd.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"config file unreadable: {path}: {type(exc).__name__}") from exc
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        match = CONFIG_LINE_RE.match(line)
+        if match is None:
+            continue
+        key, value = match.group(1), match.group(2).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key] = value
+    return values
 
 
 def read_boot_id(path: Path = Path("/proc/sys/kernel/random/boot_id")) -> str:
@@ -152,6 +193,7 @@ def default_state(boot_id: str, now: datetime, monitor: str = "boinc") -> dict[s
         "boot_id": boot_id,
         "targets": {},
         "pending_state_reset_alert": None,
+        "pending_boot_alert": None,
         "current_week": _counter_block(week_key(now)),
         "pending_weekly": None,
     }
@@ -213,6 +255,14 @@ def _validate_details(target_id: str, details: Any) -> None:
         for key in ("main_pid", "n_restarts"):
             value = details.get(key)
             if value is not None and not _is_nonnegative_int(value):
+                raise InvalidStateError(f"{target_id} last_check.{key} is invalid")
+    elif kind == "container":
+        for key in ("status", "health"):
+            if not _is_optional_str(details.get(key)):
+                raise InvalidStateError(f"{target_id} last_check.{key} is invalid")
+        for key in ("restart_count", "exit_code"):
+            value = details.get(key)
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
                 raise InvalidStateError(f"{target_id} last_check.{key} is invalid")
     elif not _is_nonnegative_int(details.get("count")):
         raise InvalidStateError(f"{target_id} last_check.count is invalid")
@@ -297,6 +347,7 @@ def validate_state(state: Any) -> dict[str, Any]:
         "boot_id",
         "targets",
         "pending_state_reset_alert",
+        "pending_boot_alert",
         "current_week",
         "pending_weekly",
     }
@@ -322,6 +373,11 @@ def validate_state(state: Any) -> dict[str, Any]:
         for key in ("backup_name", "error_type"):
             if not isinstance(reset.get(key), str) or not reset[key]:
                 raise InvalidStateError(f"pending_state_reset_alert.{key} is invalid")
+    boot = state["pending_boot_alert"]
+    if boot is not None:
+        if not isinstance(boot, dict):
+            raise InvalidStateError("pending_boot_alert is invalid")
+        required_utc(boot.get("detected_at"), "pending_boot_alert.detected_at")
     _validate_counter(state["current_week"])
     if state["pending_weekly"] is not None:
         _validate_counter(state["pending_weekly"], pending=True)
@@ -424,6 +480,7 @@ def _upgrade_flat(flat: dict[str, Any]) -> dict[str, Any]:
         "boot_id": flat["boot_id"],
         "targets": {BOINC_TARGET: target},
         "pending_state_reset_alert": flat["pending_state_reset_alert"],
+        "pending_boot_alert": None,
         "current_week": counters[0],
         "pending_weekly": counters[1],
     }
@@ -440,6 +497,8 @@ def migrate_state(raw: Any, boot_id: str, now: datetime) -> dict[str, Any]:
             f"state schema {version} is newer than supported schema {SCHEMA_VERSION}"
         )
     if version == SCHEMA_VERSION:
+        # pending_boot_alert arrived after the first schema 3 build.
+        raw.setdefault("pending_boot_alert", None)
         return validate_state(raw)
     if version == 0:
         flat = _upgrade_schema0(raw, boot_id, now)
@@ -462,6 +521,37 @@ class StateStore:
             os.chmod(self.path.parent, 0o700)
         except PermissionError:
             pass
+
+    @contextlib.contextmanager
+    def lock(
+        self,
+        timeout: float = 60.0,
+        sleeper: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+    ):
+        """Serialize every read-modify-write of the state file.
+
+        systemd never runs the oneshot unit twice at once, but a manual
+        `sentinel check` or `reset-state` can overlap a timer run.
+        """
+        self._ensure_directory()
+        lock_path = self.path.with_name(f"{self.path.name}.lock")
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            deadline = monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if monotonic() >= deadline:
+                        raise StateLockedError(
+                            f"{lock_path} is held by another sentinel process"
+                        ) from None
+                    sleeper(0.5)
+            yield
+        finally:
+            os.close(descriptor)
 
     def _backup_name(self, label: str, now: datetime) -> Path:
         stamp = now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
@@ -589,6 +679,9 @@ class TargetResult:
     # Compared against the previous check to detect restarts. None means the
     # target has nothing to compare right now (for example it is down).
     restart_marker: Optional[int] = None
+    # What is compared with the stored marker, when that differs from the
+    # marker stored for next time. None means restart_marker itself.
+    restart_compare: Optional[int] = None
     # False when the query itself failed; the stored marker is then kept.
     probe_ok: bool = True
     # None when the recovery action fits this failure, otherwise why not.
@@ -613,6 +706,7 @@ class Settings:
     targets_file: Path = Path("/etc/sentinel/targets")
     proc_root: Path = Path("/proc")
     systemctl: str = "/usr/bin/systemctl"
+    docker_socket: Path = Path("/var/run/docker.sock")
     alert_after_failures: int = 2
     reminder_hours: float = 12.0
     telegram_chat_id: str = ""
@@ -625,8 +719,17 @@ class Settings:
     recover_timeout: float = 45.0
 
     @classmethod
-    def from_environment(cls) -> "Settings":
-        credential_dir = os.environ.get("CREDENTIALS_DIRECTORY")
+    def from_environment(cls, environ: Optional[dict[str, str]] = None) -> "Settings":
+        if environ is None:
+            environ = dict(os.environ)
+        config_file = Path(environ.get("SENTINEL_CONFIG", str(CONFIG_FILE)))
+        merged = read_config_file(config_file)
+        merged.update(environ)
+        return cls._from_mapping(merged)
+
+    @classmethod
+    def _from_mapping(cls, environ: dict[str, str]) -> "Settings":
+        credential_dir = environ.get("CREDENTIALS_DIRECTORY")
         token_file = (
             Path(credential_dir) / "telegram-token"
             if credential_dir
@@ -634,26 +737,27 @@ class Settings:
         )
         try:
             return cls(
-                monitor=os.environ.get("SENTINEL_MONITOR", "boinc").strip().lower() or "boinc",
-                state_file=Path(os.environ.get("STATE_FILE", "/var/lib/sentinel/state.json")),
-                service_name=os.environ.get("BOINC_SERVICE", "boinc-client.service"),
-                boinccmd=os.environ.get("BOINCCMD", "/usr/bin/boinccmd"),
-                boinc_data_dir=Path(os.environ.get("BOINC_DATA_DIR", "/var/lib/boinc-client")),
-                cgroup_root=Path(os.environ.get("CGROUP_ROOT", "/sys/fs/cgroup")),
-                sample_seconds=float(os.environ.get("SAMPLE_SECONDS", "10")),
-                total_vcpus=float(os.environ.get("TOTAL_VCPUS", "2")),
-                cpu_threshold=float(os.environ.get("CPU_THRESHOLD", "30")),
-                targets_file=Path(os.environ.get("TARGETS_FILE", "/etc/sentinel/targets")),
-                alert_after_failures=int(os.environ.get("ALERT_AFTER_FAILURES", "2")),
-                reminder_hours=float(os.environ.get("REMINDER_HOURS", "12")),
-                telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", "").strip(),
+                monitor=environ.get("SENTINEL_MONITOR", "boinc").strip().lower() or "boinc",
+                state_file=Path(environ.get("STATE_FILE", "/var/lib/sentinel/state.json")),
+                service_name=environ.get("BOINC_SERVICE", "boinc-client.service"),
+                boinccmd=environ.get("BOINCCMD", "/usr/bin/boinccmd"),
+                boinc_data_dir=Path(environ.get("BOINC_DATA_DIR", "/var/lib/boinc-client")),
+                cgroup_root=Path(environ.get("CGROUP_ROOT", "/sys/fs/cgroup")),
+                sample_seconds=float(environ.get("SAMPLE_SECONDS", "10")),
+                total_vcpus=float(environ.get("TOTAL_VCPUS", "2")),
+                cpu_threshold=float(environ.get("CPU_THRESHOLD", "30")),
+                targets_file=Path(environ.get("TARGETS_FILE", "/etc/sentinel/targets")),
+                docker_socket=Path(environ.get("DOCKER_SOCKET", "/var/run/docker.sock")),
+                alert_after_failures=int(environ.get("ALERT_AFTER_FAILURES", "2")),
+                reminder_hours=float(environ.get("REMINDER_HOURS", "12")),
+                telegram_chat_id=environ.get("TELEGRAM_CHAT_ID", "").strip(),
                 telegram_token_file=token_file,
-                command_timeout=float(os.environ.get("COMMAND_TIMEOUT", "8")),
-                recover_enabled=_env_flag("RECOVER_ENABLED", "1"),
-                recover_after_failures=int(os.environ.get("RECOVER_AFTER_FAILURES", "1")),
-                recover_cooldown_hours=float(os.environ.get("RECOVER_COOLDOWN_HOURS", "6")),
-                recover_max_per_incident=int(os.environ.get("RECOVER_MAX_PER_INCIDENT", "2")),
-                recover_timeout=float(os.environ.get("RECOVER_TIMEOUT", "45")),
+                command_timeout=float(environ.get("COMMAND_TIMEOUT", "8")),
+                recover_enabled=_env_flag(environ, "RECOVER_ENABLED", "1"),
+                recover_after_failures=int(environ.get("RECOVER_AFTER_FAILURES", "1")),
+                recover_cooldown_hours=float(environ.get("RECOVER_COOLDOWN_HOURS", "6")),
+                recover_max_per_incident=int(environ.get("RECOVER_MAX_PER_INCIDENT", "2")),
+                recover_timeout=float(environ.get("RECOVER_TIMEOUT", "45")),
             )
         except ValueError as exc:
             raise ConfigError(f"invalid setting: {exc}") from exc
@@ -894,7 +998,7 @@ def _normalize_unit(value: str, number: int) -> str:
     return f"{value}.service"
 
 
-def parse_targets(text: str) -> list[Target]:
+def parse_targets(text: str, kinds: tuple[str, ...] = MONITOR_KINDS["process"]) -> list[Target]:
     targets: list[Target] = []
     seen: set[str] = set()
     for number, raw_line in enumerate(text.splitlines(), start=1):
@@ -904,13 +1008,19 @@ def parse_targets(text: str) -> list[Target]:
         parts = line.split(None, 1)
         kind = parts[0]
         value = parts[1].strip() if len(parts) > 1 else ""
-        if kind not in TARGET_KINDS:
-            raise ConfigError(f"targets line {number}: unknown kind {kind!r}")
+        if kind not in kinds:
+            raise ConfigError(
+                f"targets line {number}: unknown kind {kind!r} (expected {', '.join(kinds)})"
+            )
         if not value:
             raise ConfigError(f"targets line {number}: {kind} needs a value")
         pattern = None
         if kind == "service":
             value = _normalize_unit(value, number)
+        elif kind == "container":
+            value = value.lstrip("/")
+            if not CONTAINER_NAME_RE.match(value):
+                raise ConfigError(f"targets line {number}: invalid container name {value!r}")
         elif kind == "cmdline":
             try:
                 pattern = re.compile(value)
@@ -926,14 +1036,14 @@ def parse_targets(text: str) -> list[Target]:
     return targets
 
 
-def load_targets(path: Path) -> list[Target]:
+def load_targets(path: Path, kinds: tuple[str, ...] = MONITOR_KINDS["process"]) -> list[Target]:
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
         raise ConfigError(f"targets file not found: {path}") from exc
     except (OSError, UnicodeDecodeError) as exc:
         raise ConfigError(f"targets file unreadable: {path}: {type(exc).__name__}") from exc
-    return parse_targets(text)
+    return parse_targets(text, kinds)
 
 
 @dataclass
@@ -1113,8 +1223,10 @@ class ProcessMonitor:
                     target.target_id,
                     [] if matches else ["no matching process"],
                     {"count": len(matches)},
-                    # The oldest match changes only when the original process is gone.
-                    restart_marker=min(process.start_ticks for process in matches) if matches else None,
+                    # A restart means every process seen last time is gone: even
+                    # the oldest match now started after the newest one back then.
+                    restart_marker=max(process.start_ticks for process in matches) if matches else None,
+                    restart_compare=min(process.start_ticks for process in matches) if matches else None,
                     recovery_hint="process targets have no restart action",
                 )
             )
@@ -1143,6 +1255,146 @@ class ProcessMonitor:
             if result.returncode != 0:
                 return False, f"systemctl {verb} exit {result.returncode}"
         return True, "systemctl restart ok"
+
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    """HTTP over the Docker Engine's unix socket, without the docker CLI."""
+
+    def __init__(self, socket_path: Path, timeout: float):
+        super().__init__("localhost", timeout=timeout)
+        self.socket_path = socket_path
+
+    def connect(self) -> None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        try:
+            sock.connect(str(self.socket_path))
+        except OSError:
+            sock.close()
+            raise
+        self.sock = sock
+
+
+class DockerClient:
+    def __init__(self, socket_path: Path):
+        self.socket_path = socket_path
+
+    def request(self, method: str, path: str, timeout: float) -> tuple[int, bytes]:
+        connection = UnixHTTPConnection(self.socket_path, timeout)
+        try:
+            connection.request(method, path, headers={"Host": "docker"})
+            response = connection.getresponse()
+            return response.status, response.read()
+        finally:
+            connection.close()
+
+
+# Exit codes of a container stopped on purpose: clean exit, SIGTERM from
+# `docker stop`, and SIGKILL once its grace period ran out.
+STOP_EXIT_CODES = {0, 137, 143}
+
+
+class DockerMonitor:
+    """Option 3: registered Docker containers, through the Engine API socket.
+
+    A container is alive while it runs and its healthcheck, if any, is not
+    unhealthy. RestartCount counts restart-policy restarts the way NRestarts
+    does for services.
+    """
+
+    name = "docker"
+
+    def __init__(self, settings: Settings, targets: list[Target], client: Any = None):
+        self.settings = settings
+        self.targets = targets
+        self.client = client if client is not None else DockerClient(settings.docker_socket)
+        self.actions: dict[str, str] = {}
+
+    def target_ids(self) -> list[str]:
+        return [target.target_id for target in self.targets]
+
+    def _path(self, container: str, suffix: str) -> str:
+        return f"/containers/{urllib.parse.quote(container, safe='')}/{suffix}"
+
+    def _check_container(self, target: Target) -> TargetResult:
+        empty = {"status": None, "health": None, "restart_count": None, "exit_code": None}
+        try:
+            status, body = self.client.request(
+                "GET", self._path(target.value, "json"), self.settings.command_timeout
+            )
+        except (OSError, http.client.HTTPException) as exc:
+            reason = f"docker query {type(exc).__name__}"
+            return TargetResult(target.target_id, [reason], empty, probe_ok=False, recovery_hint="probe error")
+        if status == 404:
+            return TargetResult(
+                target.target_id, ["container not found"], empty, recovery_hint="container not found"
+            )
+        try:
+            if status != 200:
+                raise ValueError(f"HTTP {status}")
+            data = json.loads(body.decode("utf-8"))
+            state = data["State"]
+            if not isinstance(state, dict):
+                raise TypeError("State is not an object")
+        except (ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
+            detail = str(exc) if isinstance(exc, ValueError) and str(exc).startswith("HTTP") else type(exc).__name__
+            return TargetResult(
+                target.target_id, [f"docker query {detail}"], empty, probe_ok=False, recovery_hint="probe error"
+            )
+
+        health_block = state.get("Health")
+        health = health_block.get("Status") if isinstance(health_block, dict) else None
+        if not _is_optional_str(health):
+            health = None
+        restart_count = data.get("RestartCount")
+        exit_code = state.get("ExitCode")
+        details = {
+            "status": state.get("Status") if isinstance(state.get("Status"), str) else None,
+            "health": health,
+            "restart_count": restart_count if _is_nonnegative_int(restart_count) else None,
+            "exit_code": exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None,
+        }
+        reasons: list[str] = []
+        hint: Optional[str] = None
+        if details["status"] != "running":
+            reasons.append(f"Status={details['status']} ExitCode={_show(details['exit_code'])}")
+            crashed = details["status"] == "exited" and (
+                details["exit_code"] not in STOP_EXIT_CODES or state.get("OOMKilled") is True
+            )
+            if crashed:
+                self.actions[target.target_id] = "start"
+            elif details["status"] == "exited":
+                hint = "container was stopped, not crashed"
+            else:
+                hint = f"Status={details['status']} is not a crash"
+        elif health == "unhealthy":
+            reasons.append("Health=unhealthy")
+            # Docker never restarts an unhealthy container by itself.
+            self.actions[target.target_id] = "restart"
+        return TargetResult(
+            target.target_id,
+            reasons,
+            details,
+            restart_marker=details["restart_count"],
+            recovery_hint=hint,
+        )
+
+    def check(self) -> list[TargetResult]:
+        self.actions.clear()
+        return [self._check_container(target) for target in self.targets]
+
+    def recover(self, target_id: str) -> tuple[bool, str]:
+        action = self.actions.get(target_id, "start")
+        container = target_id.partition(":")[2]
+        try:
+            status, _ = self.client.request(
+                "POST", self._path(container, action), self.settings.recover_timeout
+            )
+        except (OSError, http.client.HTTPException) as exc:
+            return False, f"docker {action} {type(exc).__name__}"
+        if status in (204, 304):
+            return True, f"docker {action} ok"
+        return False, f"docker {action} HTTP {status}"
 
 
 class TelegramNotifier:
@@ -1206,11 +1458,14 @@ def rotate_week(state: dict[str, Any], now: datetime) -> None:
     state["current_week"] = _counter_block(new_key)
 
 
-def handle_boot_change(state: dict[str, Any], boot_id: str) -> bool:
+def handle_boot_change(
+    state: dict[str, Any], boot_id: str, now: Optional[datetime] = None
+) -> bool:
     if state["boot_id"] == boot_id:
         return False
     previous = state["boot_id"]
     state["boot_id"] = boot_id
+    state["pending_boot_alert"] = {"detected_at": utc_text(now or utc_now())}
     for target in state["targets"].values():
         target["consecutive_failures"] = 0
         target["recoveries_this_incident"] = 0
@@ -1238,14 +1493,17 @@ def restart_change(
 ) -> Optional[tuple[int, str]]:
     if previous is None or current is None:
         return None
-    if target_kind(target_id) == "service":
-        # NRestarts counts Restart= restarts only and drops back to 0 on a
-        # manual start, so only an increase is a crash restart.
+    kind = target_kind(target_id)
+    if kind in COUNTER_KINDS:
+        # NRestarts and RestartCount count supervisor restarts only and drop
+        # back to 0 on a manual start, so only an increase is a crash restart.
+        name = "NRestarts" if kind == "service" else "RestartCount"
         if current > previous:
-            return current - previous, f"NRestarts {previous}→{current}"
+            return current - previous, f"{name} {previous}→{current}"
         return None
-    if current != previous:
-        return 1, "가장 오래된 프로세스 시작 시각 변경"
+    # previous is the newest start seen last time, current the oldest now.
+    if current > previous:
+        return 1, "직전 점검의 프로세스가 모두 교체됨"
     return None
 
 
@@ -1264,7 +1522,8 @@ def apply_result(
     }
 
     if result.probe_ok:
-        change = restart_change(result.target_id, target["restart_marker"], result.restart_marker)
+        compare = result.restart_marker if result.restart_compare is None else result.restart_compare
+        change = restart_change(result.target_id, target["restart_marker"], compare)
         target["restart_marker"] = result.restart_marker
         if change is not None:
             count, detail = change
@@ -1382,6 +1641,12 @@ def _last_check_summary(target_id: str, target: dict[str, Any]) -> str:
             f"SubState={_show(details.get('sub_state'))}, "
             f"NRestarts={_show(details.get('n_restarts'))}, 원인={reasons}"
         )
+    if kind == "container":
+        health = details.get("health") or "none"
+        return (
+            f"Status={_show(details.get('status'))}, Health={health}, "
+            f"RestartCount={_show(details.get('restart_count'))}, 원인={reasons}"
+        )
     return f"프로세스={details['count']}개, 원인={reasons}"
 
 
@@ -1429,10 +1694,7 @@ def _target_notifications(
                 f"boinccmd --acct_mgr sync 실행 {progress}; {summary}"
             )
         else:
-            message = (
-                f"🔧 Sentinel 자동복구 {outcome}: {subject}; "
-                f"systemctl restart 실행 {progress}; {summary}"
-            )
+            message = f"🔧 Sentinel 자동복구 {outcome}: {subject}; {progress}; {summary}"
         notifications.append(Notification("recovery_attempt", message, target_id))
 
     restart = target["pending_restart"]
@@ -1494,6 +1756,12 @@ def pending_notifications(
             )
         )
 
+    boot = state["pending_boot_alert"]
+    if boot is not None:
+        notifications.append(
+            Notification("boot", f"🔄 Sentinel 재부팅 감지: {hostname}; 감지={boot['detected_at']}")
+        )
+
     for target_id, target in state["targets"].items():
         notifications.extend(
             _target_notifications(target_id, target, now, hostname, reminder_hours)
@@ -1504,13 +1772,15 @@ def pending_notifications(
         period = weekly["start_week"]
         if weekly["end_week"] != weekly["start_week"]:
             period = f"{weekly['start_week']}~{weekly['end_week']}"
-        counts = f"점검={weekly['checks']} 실패={weekly['failures']} 장애={weekly['incidents']}"
         current = _health_label(overall_health(state))
         if state["monitor"] == "boinc":
+            counts = f"점검={weekly['checks']} 실패={weekly['failures']} 장애={weekly['incidents']}"
             message = f"📊 Sentinel 주간 요약: {hostname} {period} {counts} 현재={current}"
         else:
+            # One run checks every target, so failures are counted per target.
             message = (
-                f"📊 Sentinel 주간 요약: {hostname} {period} {counts} "
+                f"📊 Sentinel 주간 요약: {hostname} {period} 점검={weekly['checks']} "
+                f"대상 실패={weekly['failures']} 장애={weekly['incidents']} "
                 f"재시작={weekly['restarts']} 현재={current}"
             )
             unhealthy = [
@@ -1530,6 +1800,9 @@ def mark_notification_sent(state: dict[str, Any], notification: Notification, no
         return
     if notification.kind == "weekly":
         state["pending_weekly"] = None
+        return
+    if notification.kind == "boot":
+        state["pending_boot_alert"] = None
         return
     target = state["targets"].get(notification.target_id or "")
     if target is None:
@@ -1596,10 +1869,13 @@ class Sentinel:
         self.store.save(state)
 
     def check(self, now: Optional[datetime] = None) -> int:
-        now = now or utc_now()
+        with self.store.lock():
+            return self._check(now or utc_now())
+
+    def _check(self, now: datetime) -> int:
         boot_id = self.boot_id_reader()
         state, _ = self.store.load(boot_id, now, self.monitor.name)
-        handle_boot_change(state, boot_id)
+        handle_boot_change(state, boot_id, now)
         rotate_week(state, now)
         sync_targets(state, self.monitor.name, self.monitor.target_ids())
 
@@ -1649,7 +1925,10 @@ class Sentinel:
 def build_monitor(settings: Settings) -> Any:
     if settings.monitor == "boinc":
         return BoincMonitor(settings)
-    return ProcessMonitor(settings, load_targets(settings.targets_file))
+    targets = load_targets(settings.targets_file, MONITOR_KINDS[settings.monitor])
+    if settings.monitor == "docker":
+        return DockerMonitor(settings, targets)
+    return ProcessMonitor(settings, targets)
 
 
 def build_sentinel(settings: Settings) -> Sentinel:
@@ -1700,14 +1979,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         settings.validate()
         store = StateStore(settings.state_file)
         if args.command == "show-state":
-            with settings.state_file.open("r", encoding="utf-8") as handle:
-                state = json.load(handle)
+            try:
+                with settings.state_file.open("r", encoding="utf-8") as handle:
+                    state = json.load(handle)
+            except FileNotFoundError:
+                print(f"no state yet: {settings.state_file}", file=sys.stderr)
+                return 1
             print(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True))
             return 0
         if args.command == "reset-state":
             if not args.yes:
                 parser.error("reset-state requires --yes")
-            backup = store.reset(read_boot_id(), utc_now(), settings.monitor)
+            with store.lock():
+                backup = store.reset(read_boot_id(), utc_now(), settings.monitor)
             if backup:
                 print(f"state reset; previous snapshot preserved at {backup}")
             else:
@@ -1719,6 +2003,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     except ConfigError as exc:
         LOGGER.error("configuration error: %s", exc)
         return 2
+    except StateLockedError as exc:
+        LOGGER.error("%s", exc)
+        return 4
     except FutureSchemaError as exc:
         LOGGER.critical("refusing to modify newer state: %s", exc)
         return 3

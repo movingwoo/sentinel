@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: install.sh [--monitor boinc|process]" >&2
+    echo "usage: install.sh [--monitor boinc|process|docker]" >&2
     exit 2
 }
 
@@ -53,10 +53,12 @@ if [[ -z ${monitor} ]]; then
         echo "Select what this Sentinel watches:"
         echo "  1) BOINC"
         echo "  2) services/processes"
+        echo "  3) Docker containers"
         read -r -p "choice [1]: " choice
         case "${choice:-1}" in
             1) monitor=boinc ;;
             2) monitor=process ;;
+            3) monitor=docker ;;
             *) echo "invalid choice: ${choice}" >&2; exit 2 ;;
         esac
     else
@@ -64,7 +66,7 @@ if [[ -z ${monitor} ]]; then
     fi
 fi
 case "${monitor}" in
-    boinc|process) ;;
+    boinc|process|docker) ;;
     *) echo "unknown monitor: ${monitor}" >&2; usage ;;
 esac
 if [[ -n ${configured} && ${configured} != "${monitor}" ]]; then
@@ -83,6 +85,9 @@ if [[ ${monitor} == boinc ]]; then
     [[ -x /usr/bin/boinccmd ]] || echo "warning: /usr/bin/boinccmd not found" >&2
     systemctl cat boinc-client.service >/dev/null 2>&1 \
         || echo "warning: boinc-client.service not found" >&2
+fi
+if [[ ${monitor} == docker && ! -S /var/run/docker.sock ]]; then
+    echo "warning: /var/run/docker.sock not found; is Docker installed and running?" >&2
 fi
 
 install -D -m 0755 "${source_dir}/src/sentinel.py" /usr/local/sbin/sentinel
@@ -105,29 +110,41 @@ fi
 chown root:root "${conf}" /etc/sentinel/telegram-token
 chmod 0600 "${conf}" /etc/sentinel/telegram-token
 
+# Each option installs only its own drop-ins and removes the others, so a
+# rerun after changing RECOVER_ENABLED also brings restart.conf in line.
+# timer.d/process.conf is the name the 5 minute drop-in had in the first
+# release with option 2.
+rm -f "${service_dropins}/boinc.conf" "${service_dropins}/restart.conf" \
+    "${service_dropins}/docker.conf" "${timer_dropins}/interval.conf" \
+    "${timer_dropins}/process.conf"
 if [[ ${monitor} == boinc ]]; then
     install -D -m 0644 "${source_dir}/systemd/sentinel.service.d/boinc.conf" \
         "${service_dropins}/boinc.conf"
-    rm -f "${service_dropins}/restart.conf" "${timer_dropins}/process.conf"
 else
-    rm -f "${service_dropins}/boinc.conf"
-    install -D -m 0644 "${source_dir}/systemd/sentinel.timer.d/process.conf" \
-        "${timer_dropins}/process.conf"
-    # systemctl restart needs CAP_SYS_ADMIN; grant it only while auto-recovery is on.
-    case "$(conf_value RECOVER_ENABLED)" in
-        0|false|no|off)
-            rm -f "${service_dropins}/restart.conf"
-            ;;
-        *)
-            install -D -m 0644 "${source_dir}/systemd/sentinel.service.d/restart.conf" \
-                "${service_dropins}/restart.conf"
-            ;;
-    esac
+    install -D -m 0644 "${source_dir}/systemd/sentinel.timer.d/interval.conf" \
+        "${timer_dropins}/interval.conf"
+    if [[ ${monitor} == docker ]]; then
+        install -D -m 0644 "${source_dir}/systemd/sentinel.service.d/docker.conf" \
+            "${service_dropins}/docker.conf"
+        example=targets.docker.example
+        prompt="container <name>"
+    else
+        # systemctl restart needs CAP_SYS_ADMIN; grant it only while auto-recovery is on.
+        case "$(conf_value RECOVER_ENABLED)" in
+            0|false|no|off) ;;
+            *)
+                install -D -m 0644 "${source_dir}/systemd/sentinel.service.d/restart.conf" \
+                    "${service_dropins}/restart.conf"
+                ;;
+        esac
+        example=targets.example
+        prompt="service <unit> | process <name> | cmdline <regex>"
+    fi
 
     if [[ ! -e ${targets} ]]; then
-        install -m 0600 "${source_dir}/config/targets.example" "${targets}"
+        install -m 0600 "${source_dir}/config/${example}" "${targets}"
         if [[ -t 0 ]]; then
-            echo "Register targets, one per line: service <unit> | process <name> | cmdline <regex>"
+            echo "Register targets, one per line: ${prompt}"
             echo "Finish with an empty line."
             while IFS= read -r -p "> " line && [[ -n ${line} ]]; do
                 printf '%s\n' "${line}" >>"${targets}"
@@ -142,8 +159,9 @@ fi
 # restarting BOINC, then enable only the Sentinel timer.
 systemctl daemon-reload
 
-if [[ ${monitor} == process ]]; then
-    if ! (set -a; . "${conf}"; set +a; /usr/local/sbin/sentinel check-config); then
+if [[ ${monitor} != boinc ]]; then
+    # sentinel reads sentinel.conf itself when started from a shell.
+    if ! /usr/local/sbin/sentinel check-config; then
         echo "check-config failed. Fix ${targets}, then rerun install.sh" >&2
         echo "or check with: sudo /usr/local/sbin/sentinel check-config" >&2
         exit 1

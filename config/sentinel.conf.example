@@ -2,7 +2,8 @@
 # Keep the bot token out of this file; it belongs in telegram-token.
 TELEGRAM_CHAT_ID=
 
-# What this Sentinel watches: boinc (option 1) or process (option 2).
+# What this Sentinel watches: boinc (option 1), process (option 2) or
+# docker (option 3).
 # install.sh appends this line; a missing value means boinc.
 # SENTINEL_MONITOR=boinc
 
@@ -30,6 +31,9 @@ TELEGRAM_CHAT_ID=
 # and `systemctl restart`. The cooldown and the per-incident budget apply per
 # target. The restart needs the sentinel.service.d/restart.conf drop-in; rerun
 # install.sh after changing RECOVER_ENABLED so the drop-in follows it.
+#
+# docker: a crashed container gets `start`, an unhealthy one `restart`,
+# through the Engine API. No extra privilege is needed.
 
 # Option 1 (boinc) only. The defaults match the Osaka A1.Flex instance.
 # TOTAL_VCPUS=2
@@ -40,5 +44,8 @@ TELEGRAM_CHAT_ID=
 # BOINC_DATA_DIR=/var/lib/boinc-client
 # CGROUP_ROOT=/sys/fs/cgroup
 
-# Option 2 (process) only.
+# Options 2 and 3 (process, docker).
 # TARGETS_FILE=/etc/sentinel/targets
+
+# Option 3 (docker) only.
+# DOCKER_SOCKET=/var/run/docker.sock

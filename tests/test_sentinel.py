@@ -703,6 +703,7 @@ class SettingsTests(unittest.TestCase):
     def env(self, **values):
         from unittest import mock
 
+        values.setdefault("SENTINEL_CONFIG", "/nonexistent/sentinel.conf")
         return mock.patch.dict("os.environ", values, clear=True)
 
     def test_monitor_defaults_to_boinc_for_existing_installs(self):
@@ -918,7 +919,8 @@ class ProcessCheckTests(unittest.TestCase):
         results = self.check("process caddy\nprocess main.py\nprocess pm2-runtime\nprocess nginx\n")
 
         self.assertEqual(results["process:caddy"].details, {"count": 2})
-        self.assertEqual(results["process:caddy"].restart_marker, 500)
+        self.assertEqual(results["process:caddy"].restart_marker, 700)
+        self.assertEqual(results["process:caddy"].restart_compare, 500)
         self.assertTrue(results["process:main.py"].healthy)
         self.assertTrue(results["process:pm2-runtime"].healthy)
         self.assertEqual(results["process:nginx"].reasons, ["no matching process"])
@@ -995,12 +997,13 @@ def service_result(target_id="service:a.service", active="active", restarts=0, p
     )
 
 
-def process_result(target_id="process:caddy", start=100):
+def process_result(target_id="process:caddy", start=100, oldest=None):
     return rg.TargetResult(
         target_id,
         [] if start is not None else ["no matching process"],
         {"count": 1 if start is not None else 0},
         restart_marker=start,
+        restart_compare=oldest,
     )
 
 
@@ -1047,6 +1050,15 @@ class RestartDetectionTests(unittest.TestCase):
         self.apply(process_result(start=None), 10)
         target = self.apply(process_result(start=400), 15)
         self.assertIsNone(target["pending_restart"])
+
+    def test_surviving_instance_is_not_a_restart(self):
+        # Last check saw processes started at 500 and 700; the 500 one died.
+        self.apply(process_result(start=700, oldest=500))
+        target = self.apply(process_result(start=900, oldest=700), 5)
+        self.assertIsNone(target["pending_restart"])
+        # Now every process is newer than the newest seen before.
+        target = self.apply(process_result(start=1200, oldest=1000), 10)
+        self.assertEqual(target["pending_restart"]["detail"], "직전 점검의 프로세스가 모두 교체됨")
 
     def test_boot_change_clears_markers(self):
         self.apply(process_result(start=100))
@@ -1134,7 +1146,7 @@ class ProcessNotificationTests(unittest.TestCase):
         }
         weekly = [note for note in self.notes(5) if note.kind == "weekly"][0]
         self.assertEqual(weekly.message, (
-            "📊 Sentinel 주간 요약: host 2026-W38 점검=2016 실패=4 장애=1 재시작=2 현재=장애; "
+            "📊 Sentinel 주간 요약: host 2026-W38 점검=2016 대상 실패=4 장애=1 재시작=2 현재=장애; "
             "장애 대상=process:caddy"
         ))
 
@@ -1184,7 +1196,7 @@ class ProcessIntegrationTests(unittest.TestCase):
         self.assertEqual(target["recoveries_this_incident"], 1)
         self.assertEqual(target["last_recovery_at"], rg.utc_text(self.now))
         self.assertEqual(self.notifier.messages, [
-            "🔧 Sentinel 자동복구 성공: host service:a.service; systemctl restart 실행 "
+            "🔧 Sentinel 자동복구 성공: host service:a.service; "
             "(1/2회차, systemctl restart ok); "
             "ActiveState=failed, SubState=failed, NRestarts=0, 원인=ActiveState=failed"
         ])
@@ -1259,6 +1271,7 @@ class MainTests(unittest.TestCase):
                 "SENTINEL_MONITOR": "process",
                 "TARGETS_FILE": str(targets),
                 "STATE_FILE": str(Path(directory) / "state.json"),
+                "SENTINEL_CONFIG": str(Path(directory) / "missing.conf"),
             }
             # configure_logging() would attach a root handler for the rest of the run.
             with mock.patch.dict("os.environ", env, clear=True), mock.patch.object(
@@ -1267,6 +1280,318 @@ class MainTests(unittest.TestCase):
                 with self.assertLogs("sentinel", "ERROR") as logs:
                     self.assertEqual(rg.main(["check-config"]), 2)
             self.assertIn("targets line 1: unknown kind", logs.output[0])
+
+
+class ConfigFileTests(unittest.TestCase):
+    def test_shell_invocation_reads_sentinel_conf(self):
+        with tempfile.TemporaryDirectory() as directory:
+            conf = Path(directory) / "sentinel.conf"
+            conf.write_text(
+                "# comment\n"
+                "SENTINEL_MONITOR=process\n"
+                "TARGETS_FILE=\"/srv/targets\"\n"
+                "export REMINDER_HOURS='6'\n"
+                "garbage line\n",
+                encoding="utf-8",
+            )
+            settings = rg.Settings.from_environment({"SENTINEL_CONFIG": str(conf)})
+        self.assertEqual(settings.monitor, "process")
+        self.assertEqual(settings.targets_file, Path("/srv/targets"))
+        self.assertEqual(settings.reminder_hours, 6.0)
+
+    def test_environment_wins_over_the_file_like_under_systemd(self):
+        with tempfile.TemporaryDirectory() as directory:
+            conf = Path(directory) / "sentinel.conf"
+            conf.write_text("SENTINEL_MONITOR=process\n", encoding="utf-8")
+            settings = rg.Settings.from_environment(
+                {"SENTINEL_CONFIG": str(conf), "SENTINEL_MONITOR": "docker"}
+            )
+        self.assertEqual(settings.monitor, "docker")
+
+    def test_missing_file_falls_back_to_defaults(self):
+        settings = rg.Settings.from_environment({"SENTINEL_CONFIG": "/nonexistent/sentinel.conf"})
+        self.assertEqual(settings.monitor, "boinc")
+
+    def test_unreadable_file_is_a_config_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(rg.ConfigError):
+                # A directory stands in for a file that cannot be read.
+                rg.Settings.from_environment({"SENTINEL_CONFIG": directory})
+
+
+class LockTests(unittest.TestCase):
+    def test_second_holder_times_out_and_release_frees_the_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rg.StateStore(Path(directory) / "state.json")
+            other = rg.StateStore(Path(directory) / "state.json")
+            with store.lock():
+                with self.assertRaises(rg.StateLockedError):
+                    with other.lock(timeout=0, sleeper=lambda _: None):
+                        pass
+            with other.lock(timeout=0):
+                pass
+            self.assertTrue((Path(directory) / "state.json.lock").exists())
+
+    def test_check_refuses_to_run_while_another_check_holds_the_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            sentinel, notifier = boinc_sentinel(path, rg.CheckResult(True, 1, 50))
+            original = sentinel.store.lock
+            sentinel.store.lock = lambda: original(timeout=0)
+            with rg.StateStore(path).lock():
+                with self.assertRaises(rg.StateLockedError):
+                    sentinel.check(at("2026-09-23T00:00:00Z"))
+            self.assertFalse(path.exists())
+            sentinel.check(at("2026-09-23T00:00:00Z"))
+            self.assertTrue(path.exists())
+
+
+class BootAlertTests(unittest.TestCase):
+    def test_boot_change_is_announced_once(self):
+        now = at("2026-09-23T00:00:00Z")
+        state = boinc_state("boot-a", now)
+        rg.handle_boot_change(state, "boot-b", now)
+        notes = rg.pending_notifications(state, now, "host", 12)
+        self.assertEqual([(note.kind, note.message) for note in notes], [
+            ("boot", "🔄 Sentinel 재부팅 감지: host; 감지=2026-09-23T00:00:00Z"),
+        ])
+        rg.mark_notification_sent(state, notes[0], now)
+        self.assertEqual(rg.pending_notifications(state, now, "host", 12), [])
+
+    def test_first_run_and_corrupt_reset_are_not_reboots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            sentinel, notifier = boinc_sentinel(path, rg.CheckResult(True, 1, 50))
+            sentinel.check(at("2026-09-23T00:00:00Z"))
+            self.assertEqual(notifier.messages, [])
+
+            sentinel.boot_id_reader = lambda: "boot-2"
+            sentinel.check(at("2026-09-23T00:15:00Z"))
+            self.assertEqual(len(notifier.messages), 1)
+            self.assertTrue(notifier.messages[0].startswith("🔄 Sentinel 재부팅 감지: host"))
+
+    def test_schema_three_state_without_the_field_still_loads(self):
+        state = boinc_state("boot", at("2026-09-23T00:00:00Z"))
+        del state["pending_boot_alert"]
+        migrated = rg.migrate_state(state, "boot", at("2026-09-23T00:00:00Z"))
+        self.assertIsNone(migrated["pending_boot_alert"])
+
+
+class ShowStateTests(unittest.TestCase):
+    def test_missing_state_is_a_message_not_a_traceback(self):
+        from contextlib import redirect_stderr
+        from io import StringIO
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            env = {
+                "STATE_FILE": str(Path(directory) / "state.json"),
+                "SENTINEL_CONFIG": str(Path(directory) / "missing.conf"),
+            }
+            stderr = StringIO()
+            with mock.patch.dict("os.environ", env, clear=True), mock.patch.object(
+                rg, "configure_logging"
+            ), redirect_stderr(stderr):
+                self.assertEqual(rg.main(["show-state"]), 1)
+            self.assertIn("no state yet", stderr.getvalue())
+
+
+def container_json(status="running", exit_code=0, restart_count=0, health=None, oom=False):
+    state = {"Status": status, "ExitCode": exit_code, "OOMKilled": oom}
+    if health is not None:
+        state["Health"] = {"Status": health}
+    return json.dumps({"State": state, "RestartCount": restart_count}).encode()
+
+
+class FakeDocker:
+    def __init__(self, responses=None):
+        self.responses = responses or {}
+        self.calls = []
+
+    def request(self, method, path, timeout):
+        self.calls.append((method, path, timeout))
+        outcome = self.responses.get((method, path), (404, b"{}"))
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+class DockerCheckTests(unittest.TestCase):
+    def check(self, response):
+        client = FakeDocker({("GET", "/containers/web/json"): response})
+        monitor = rg.DockerMonitor(
+            rg.Settings(monitor="docker"), rg.parse_targets("container web\n", ("container",)), client
+        )
+        return monitor.check()[0], monitor
+
+    def test_running_container_is_healthy(self):
+        result, _ = self.check((200, container_json(restart_count=3, health="healthy")))
+        self.assertTrue(result.healthy)
+        self.assertEqual(result.restart_marker, 3)
+        self.assertEqual(result.details["health"], "healthy")
+
+    def test_unhealthy_container_gets_a_restart(self):
+        result, monitor = self.check((200, container_json(health="unhealthy")))
+        self.assertEqual(result.reasons, ["Health=unhealthy"])
+        self.assertIsNone(result.recovery_hint)
+        self.assertEqual(monitor.actions, {"container:web": "restart"})
+
+    def test_crashed_container_gets_a_start(self):
+        for exit_code, oom in ((1, False), (139, False), (137, True)):
+            result, monitor = self.check((200, container_json("exited", exit_code, oom=oom)))
+            self.assertEqual(result.reasons, [f"Status=exited ExitCode={exit_code}"])
+            self.assertIsNone(result.recovery_hint)
+            self.assertEqual(monitor.actions, {"container:web": "start"})
+
+    def test_stopped_container_is_left_alone(self):
+        for exit_code in (0, 137, 143):
+            result, monitor = self.check((200, container_json("exited", exit_code)))
+            self.assertFalse(result.healthy)
+            self.assertEqual(result.recovery_hint, "container was stopped, not crashed")
+            self.assertEqual(monitor.actions, {})
+
+    def test_restarting_or_paused_is_not_a_crash(self):
+        result, _ = self.check((200, container_json("restarting", 1)))
+        self.assertEqual(result.recovery_hint, "Status=restarting is not a crash")
+
+    def test_missing_container_and_query_errors(self):
+        result, _ = self.check((404, b'{"message":"No such container: web"}'))
+        self.assertEqual(result.reasons, ["container not found"])
+        self.assertTrue(result.probe_ok)
+
+        result, _ = self.check(FileNotFoundError())
+        self.assertEqual(result.reasons, ["docker query FileNotFoundError"])
+        self.assertFalse(result.probe_ok)
+
+        result, _ = self.check((500, b"{}"))
+        self.assertEqual(result.reasons, ["docker query HTTP 500"])
+
+        result, _ = self.check((200, b"not json"))
+        self.assertFalse(result.probe_ok)
+
+        for body in (b'{"State": null}', b'[]', b'{"State": {"Status": "running", "Health": "odd"}}'):
+            result, _ = self.check((200, body))
+            self.assertIsInstance(result.reasons, list)
+        self.assertTrue(result.healthy)
+        self.assertIsNone(result.details["health"])
+
+    def test_recover_posts_the_action(self):
+        client = FakeDocker({
+            ("GET", "/containers/web/json"): (200, container_json("exited", 1)),
+            ("POST", "/containers/web/start"): (204, b""),
+        })
+        monitor = rg.DockerMonitor(
+            rg.Settings(monitor="docker", recover_timeout=45),
+            rg.parse_targets("container web\n", ("container",)),
+            client,
+        )
+        monitor.check()
+        self.assertEqual(monitor.recover("container:web"), (True, "docker start ok"))
+        self.assertEqual(client.calls[-1], ("POST", "/containers/web/start", 45))
+
+        client.responses[("POST", "/containers/web/start")] = (500, b"{}")
+        self.assertEqual(monitor.recover("container:web"), (False, "docker start HTTP 500"))
+        client.responses[("POST", "/containers/web/start")] = TimeoutError()
+        self.assertEqual(monitor.recover("container:web"), (False, "docker start TimeoutError"))
+
+    def test_container_targets_parse_only_for_the_docker_monitor(self):
+        targets = rg.parse_targets("container /web\ncontainer 3f2a9c\n", ("container",))
+        self.assertEqual([t.target_id for t in targets], ["container:web", "container:3f2a9c"])
+        with self.assertRaises(rg.ConfigError):
+            rg.parse_targets("service a\n", ("container",))
+        with self.assertRaises(rg.ConfigError):
+            rg.parse_targets("container web\n")
+        with self.assertRaises(rg.ConfigError):
+            rg.parse_targets("container ../etc\n", ("container",))
+
+    def test_restart_count_increase_is_a_restart(self):
+        state = rg.default_state("boot", at("2026-09-23T00:00:00Z"), "docker")
+        rg.sync_targets(state, "docker", ["container:web"])
+        for minutes, count in ((0, 2), (5, 4)):
+            result, _ = self.check((200, container_json(restart_count=count)))
+            rg.apply_result(state, result, at("2026-09-23T00:00:00Z") + timedelta(minutes=minutes), 2)
+        notes = rg.pending_notifications(state, at("2026-09-23T00:05:00Z"), "host", 12)
+        self.assertEqual(notes[0].message, (
+            "🔁 Sentinel 재시작: host container:web; 재시작=2회, 감지=2026-09-23T00:05:00Z, "
+            "RestartCount 2→4; Status=running, Health=none, RestartCount=4, 원인=없음"
+        ))
+
+
+class DockerIntegrationTests(unittest.TestCase):
+    def test_crashed_container_is_started_once_then_announced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            client = FakeDocker({
+                ("GET", "/containers/web/json"): (200, container_json("exited", 1)),
+                ("POST", "/containers/web/start"): (204, b""),
+            })
+            settings = rg.Settings(monitor="docker", state_file=path)
+            monitor = rg.DockerMonitor(
+                settings, rg.parse_targets("container web\n", ("container",)), client
+            )
+            notifier = FakeNotifier(True)
+            sentinel = rg.Sentinel(
+                settings, rg.StateStore(path), monitor, notifier, "host",
+                boot_id_reader=lambda: "boot",
+            )
+            sentinel.check(at("2026-09-23T00:00:00Z"))
+            sentinel.check(at("2026-09-23T00:05:00Z"))
+            posts = [call for call in client.calls if call[0] == "POST"]
+            self.assertEqual(len(posts), 1)
+            self.assertEqual(notifier.messages[0], (
+                "🔧 Sentinel 자동복구 성공: host container:web; (1/2회차, docker start ok); "
+                "Status=exited, Health=none, RestartCount=0, 원인=Status=exited ExitCode=1"
+            ))
+            self.assertTrue(notifier.messages[1].startswith("🚨 Sentinel 장애: host container:web"))
+
+    def test_build_monitor_picks_docker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            targets = Path(directory) / "targets"
+            targets.write_text("container web\n", encoding="utf-8")
+            monitor = rg.build_monitor(rg.Settings(monitor="docker", targets_file=targets))
+        self.assertIsInstance(monitor, rg.DockerMonitor)
+        self.assertEqual(monitor.target_ids(), ["container:web"])
+
+
+class DockerClientTests(unittest.TestCase):
+    def test_request_speaks_http_over_the_unix_socket(self):
+        import http.server
+        import socketserver
+        import threading
+
+        seen = {}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen["path"] = self.path
+                body = container_json(restart_count=1)
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def address_string(self):
+                return "unix"
+
+            def log_message(self, *args):
+                pass
+
+        # AF_UNIX paths are limited to about 100 bytes, so stay short.
+        directory = tempfile.mkdtemp(prefix="snt", dir="/tmp")
+        socket_path = Path(directory) / "d.sock"
+        server = socketserver.UnixStreamServer(str(socket_path), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            status, body = rg.DockerClient(socket_path).request("GET", "/containers/web/json", 5)
+        finally:
+            server.shutdown()
+            server.server_close()
+            socket_path.unlink()
+            Path(directory).rmdir()
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["RestartCount"], 1)
+        self.assertEqual(seen["path"], "/containers/web/json")
 
 
 class UnitTests(unittest.TestCase):
@@ -1293,8 +1618,13 @@ class UnitTests(unittest.TestCase):
         dropin = self.read("sentinel.service.d/restart.conf")
         self.assertIn("CapabilityBoundingSet=CAP_SYS_ADMIN\n", dropin)
 
-    def test_process_timer_resets_the_calendar(self):
-        dropin = self.read("sentinel.timer.d/process.conf")
+    def test_docker_dropin_adds_ordering_only(self):
+        dropin = self.read("sentinel.service.d/docker.conf")
+        self.assertIn("After=docker.service\n", dropin)
+        self.assertNotIn("Capability", dropin)
+
+    def test_fast_timer_resets_the_calendar(self):
+        dropin = self.read("sentinel.timer.d/interval.conf")
         self.assertIn("OnCalendar=\nOnCalendar=*:0/5\n", dropin)
 
 

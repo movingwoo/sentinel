@@ -1,0 +1,13 @@
+# Sentinel option 3 targets, installed as /etc/sentinel/targets with mode 0600.
+# One container per line, by name or ID. Blank lines and # comments are ignored.
+#
+#   container <name>   fails unless Status=running and the healthcheck, if
+#                      any, is not unhealthy. With auto-recovery on, a
+#                      crashed container gets `start` and an unhealthy one
+#                      gets `restart`; a container stopped on purpose (exit
+#                      code 0, 137 or 143 without OOM) is left alone.
+#
+# Validate after editing: sudo /usr/local/sbin/sentinel check-config
+#
+# container web
+# container db
