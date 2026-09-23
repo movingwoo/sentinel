@@ -1,10 +1,15 @@
 # Sentinel
 
 이게 뭐임?  
-BOINC 서비스와 CPU를 지켜보는 감시자.  
-텔레그램 연동하여 자원 사용량에 문제가 있으면 경고함.
+서버를 지켜보다 문제가 생기면 텔레그램으로 경고하는 감시자.  
+서버마다 둘 중 하나를 골라 설치함.
 
-## 동작
+1. `boinc`: BOINC 서비스와 CPU 사용량 감시 (기존 동작)
+2. `process`: 등록한 systemd 서비스나 프로세스의 생존과 재시작 감시
+
+`/etc/sentinel/sentinel.conf`의 `SENTINEL_MONITOR`로 정함. 값이 없으면 `boinc`.
+
+## 1옵션 `boinc` 동작
 
 - `sentinel.timer`가 15분마다 one-shot 서비스를 실행
 - 각 실행은 `boinc-client.service`의 cgroup v2 `cpu.stat`을 10초간 측정
@@ -16,7 +21,7 @@ BOINC 서비스와 CPU를 지켜보는 감시자.
 - 일감 고갈로 판정되면 `boinccmd --acct_mgr sync`로 자동복구를 1회 시도함 (아래 참고)
 - 각 측정 상세는 journal에 남고 누적 DB는 만들지 않고 파일 DB 사용
 
-## 자동복구
+### 1옵션 자동복구
 
 BOINC는 살아있는데 할 일이 없는 상태는 account manager가 일감 있는 프로젝트를
 다시 배정하면 풀림. 그 신호를 감지하면 `boinccmd --acct_mgr sync`를 실행함.
@@ -42,6 +47,40 @@ BOINC는 살아있는데 할 일이 없는 상태는 account manager가 일감 �
 
 끄려면 `/etc/sentinel/sentinel.conf`에 `RECOVER_ENABLED=0`.
 
+## 2옵션 `process` 동작
+
+- `sentinel.timer`가 5분마다 실행 (`sentinel.timer.d/process.conf`)
+- 대상은 `/etc/sentinel/targets`에 한 줄에 하나씩 등록
+
+```text
+service tailscaled.service
+process caddy
+cmdline ^/usr/bin/python3 /opt/bot/main\.py
+```
+
+- `service <unit>`: `ActiveState`가 `active`가 아니면 실패. 확장자 없으면 `.service`를 붙임
+- `process <name>`: `/proc/<pid>/comm` 또는 argv[0] basename이 정확히 같은 프로세스가 없으면 실패
+- `cmdline <regex>`: 전체 명령행에 정규식이 걸리는 프로세스가 없으면 실패. `python3`, `node`처럼 이름만으로 구분 안 되는 스크립트용
+- 대상마다 장애 확정, 재알림, 복구가 따로 돌아감. 2회 연속 실패면 약 10분 안에 알림
+- 재시작 감지: 서비스는 `NRestarts` 증가, 프로세스는 가장 오래된 일치 프로세스의 시작 시각 변화. 관리자의 수동 재시작은 서비스는 알리지 않고 프로세스는 구분 못 해서 알림
+- 크래시 루프는 첫 재시작만 바로 알리고 이후 `REMINDER_HOURS` 동안 횟수를 모아 한 번에 보냄
+- 주간 요약에 재시작 횟수와 현재 장애 대상이 추가됨
+- targets 파일을 고치면 `sudo /usr/local/sbin/sentinel check-config`로 검증. 상태 파일은 건드리지 않고 대상별 현재 상태만 출력함
+
+### 2옵션 자동복구
+
+`ActiveState=failed`인 **service 대상만** `systemctl reset-failed` 후 `systemctl restart`함.
+`inactive`는 관리자가 멈춘 것으로 보고, `activating`은 systemd가 이미 처리 중이라 건드리지 않음.
+process/cmdline 대상은 재시작 방법이 없어서 알림만 보냄.
+
+BOINC와 같은 `RECOVER_*` 설정을 쓰고 쿨다운과 장애당 시도 상한은 대상마다 따로 셈.
+시도 전에 쿨다운을 먼저 저장하는 것도 같음.
+
+systemd는 호출자의 capability를 볼 수 있으면 root라도 `CAP_SYS_ADMIN`이 있어야 restart를
+허가함(`sd_bus_query_sender_privilege`). 기본 유닛은 capability를 전부 버리므로 설치기가
+`sentinel.service.d/restart.conf`로 `CAP_SYS_ADMIN` 하나만 돌려줌.
+`RECOVER_ENABLED=0`으로 두고 설치기를 다시 돌리면 이 drop-in을 지우고 알림만 하는 모드가 됨.
+
 ## 설치
 
 Ubuntu 24.04의 root 셸에서 저장소 기준
@@ -51,11 +90,18 @@ Ubuntu 24.04의 root 셸에서 저장소 기준
 `telegram-token`, `.env` 파일은 Git에서 제외됨.
 
 ```sh
-sudo ./install.sh
+sudo ./install.sh                     # 새 설치면 1) BOINC 2) 서비스/프로세스 메뉴
+sudo ./install.sh --monitor boinc
+sudo ./install.sh --monitor process
 ```
 
 인스톨러는 기존 상태와 로컬 설정을 덮어쓰지 않음.  
 BOINC를 재시작하지 않고 `systemctl daemon-reload`만 수행한 뒤 timer를 활성화.
+
+- 옵션은 `--monitor`, 기존 `sentinel.conf`의 `SENTINEL_MONITOR` 순으로 정함. 기존 conf에 값이 없으면 업그레이드로 보고 `boinc`
+- 기존 conf와 다른 옵션을 주면 중단함. 바꾸려면 conf의 `SENTINEL_MONITOR`를 먼저 고칠 것
+- `boinc`: `boinc` 그룹이 없으면 중단. BOINC 전용 설정(`SupplementaryGroups=boinc` 등)은 `sentinel.service.d/boinc.conf` drop-in으로만 설치되므로 BOINC 없는 서버에서도 기본 유닛이 뜸
+- `process`: targets 파일이 없으면 대상을 입력받아 만들고 `check-config`가 실패하면 timer를 켜지 않고 중단
 
 기존 Telegram bot의 chat ID를 root 전용 설정에 기록해야 함.
 
@@ -87,10 +133,11 @@ sudo /usr/local/sbin/sentinel show-state
 상태는 `/var/lib/sentinel/state.json` 하나이며 systemd `StateDirectory`가 만든 `0700 root:root` 디렉터리에 `0600 root:root`로 저장.  
 같은 디렉터리의 임시 파일을 `fsync`하고 `os.replace()`로 교체.
 
-- 부팅 ID 변경: 연속 실패 횟수와 장애당 복구 시도 횟수를 0으로 초기화. 쿨다운은 재부팅으로 풀리지 않음
+- 부팅 ID 변경: 대상마다 연속 실패 횟수, 장애당 복구 시도 횟수, 재시작 기준값을 초기화. 쿨다운은 재부팅으로 풀리지 않음
 - 주 변경: 지난 카운터를 고정 크기 pending summary로 옮김
 - 손상된 JSON: `state.json.corrupt-<UTC>`로 보존, 초기화 알림을 재시도
-- schema 0, 1: 현재 schema로 마이그레이션 (기존 카운터와 장애 이력은 보존)
+- schema 0, 1, 2: schema 3으로 마이그레이션. BOINC 장애 이력과 자동복구 기록은 `targets.boinc`로 옮겨지고 카운터는 보존
+- targets 파일에서 빠진 대상: 상태에서 지우고 journal에 남김
 - 더 새로운 schema: 파일을 수정하지 않고 서비스가 오류로 종료
 
 수동 초기화도 파일을 삭제하지 않고 timestamp 백업을 만듦.

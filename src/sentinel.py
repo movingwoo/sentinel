@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BOINC CPU Sentinel for an OCI Always Free exit node."""
+"""Sentinel: BOINC or service/process health checks with Telegram alerts."""
 
 from __future__ import annotations
 
@@ -22,10 +22,31 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 KST = timezone(timedelta(hours=9), name="KST")
 LOGGER = logging.getLogger("sentinel")
 EXECUTING_RE = re.compile(r"^\s*active_task_state\s*:\s*EXECUTING\s*$", re.MULTILINE)
+
+MONITORS = ("boinc", "process")
+BOINC_TARGET = "boinc"
+TARGET_KINDS = ("service", "process", "cmdline")
+UNIT_NAME_RE = re.compile(r"^[A-Za-z0-9:_.@\\-]+$")
+OTHER_UNIT_TYPES = {
+    "automount",
+    "device",
+    "mount",
+    "path",
+    "scope",
+    "slice",
+    "socket",
+    "swap",
+    "target",
+    "timer",
+}
+# /proc/<pid>/comm holds at most TASK_COMM_LEN - 1 bytes.
+COMM_LENGTH = 15
+COUNTER_KEYS = ("checks", "failures", "incidents", "restarts")
+HEALTH_ORDER = ("healthy", "unknown", "degraded", "unhealthy")
 
 
 class StateError(RuntimeError):
@@ -38,6 +59,10 @@ class FutureSchemaError(StateError):
 
 class InvalidStateError(StateError):
     """Raised when a state file has invalid JSON or structure."""
+
+
+class ConfigError(ValueError):
+    """Raised when settings or the targets file are invalid."""
 
 
 def utc_now() -> datetime:
@@ -91,14 +116,18 @@ def read_boot_id(path: Path = Path("/proc/sys/kernel/random/boot_id")) -> str:
     return path.read_text(encoding="ascii").strip()
 
 
+def target_kind(target_id: str) -> str:
+    if target_id == BOINC_TARGET:
+        return BOINC_TARGET
+    return target_id.partition(":")[0]
+
+
 def _counter_block(key: str) -> dict[str, Any]:
-    return {"week": key, "checks": 0, "failures": 0, "incidents": 0}
+    return {"week": key, "checks": 0, "failures": 0, "incidents": 0, "restarts": 0}
 
 
-def default_state(boot_id: str, now: datetime) -> dict[str, Any]:
+def default_target_state() -> dict[str, Any]:
     return {
-        "schema_version": SCHEMA_VERSION,
-        "boot_id": boot_id,
         "health": "unknown",
         "consecutive_failures": 0,
         "incident_started_at": None,
@@ -110,6 +139,18 @@ def default_state(boot_id: str, now: datetime) -> dict[str, Any]:
         "pending_recovery_alert": None,
         "last_recovery_at": None,
         "recoveries_this_incident": 0,
+        "restart_marker": None,
+        "pending_restart": None,
+        "last_restart_alert_at": None,
+    }
+
+
+def default_state(boot_id: str, now: datetime, monitor: str = "boinc") -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "monitor": monitor,
+        "boot_id": boot_id,
+        "targets": {},
         "pending_state_reset_alert": None,
         "current_week": _counter_block(week_key(now)),
         "pending_weekly": None,
@@ -120,6 +161,10 @@ def _is_nonnegative_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+def _is_optional_str(value: Any) -> bool:
+    return value is None or isinstance(value, str)
+
+
 def _validate_counter(value: Any, pending: bool = False) -> None:
     if not isinstance(value, dict):
         raise InvalidStateError("weekly counter is not an object")
@@ -127,66 +172,33 @@ def _validate_counter(value: Any, pending: bool = False) -> None:
     for key in keys:
         if not isinstance(value.get(key), str) or not value[key]:
             raise InvalidStateError(f"weekly counter has invalid {key}")
-    for key in ("checks", "failures", "incidents"):
+    for key in COUNTER_KEYS:
         if not _is_nonnegative_int(value.get(key)):
             raise InvalidStateError(f"weekly counter has invalid {key}")
     if pending:
         required_utc(value.get("due_at"), "pending_weekly.due_at")
 
 
-def validate_state(state: Any) -> dict[str, Any]:
-    if not isinstance(state, dict):
-        raise InvalidStateError("state root is not an object")
-    required = {
-        "schema_version",
-        "boot_id",
-        "health",
-        "consecutive_failures",
-        "incident_started_at",
-        "incident_confirmed",
-        "incident_alert_sent",
-        "last_alert_at",
-        "last_check",
-        "pending_recovery",
-        "pending_recovery_alert",
-        "last_recovery_at",
-        "recoveries_this_incident",
-        "pending_state_reset_alert",
-        "current_week",
-        "pending_weekly",
-    }
-    missing = required.difference(state)
-    if missing:
-        raise InvalidStateError(f"state is missing keys: {', '.join(sorted(missing))}")
-    if state["schema_version"] != SCHEMA_VERSION:
-        raise InvalidStateError("state has the wrong schema after migration")
-    if not isinstance(state["boot_id"], str):
-        raise InvalidStateError("boot_id is invalid")
-    if state["health"] not in {"unknown", "healthy", "degraded", "unhealthy"}:
-        raise InvalidStateError("health is invalid")
-    if not _is_nonnegative_int(state["consecutive_failures"]):
-        raise InvalidStateError("consecutive_failures is invalid")
-    for key in ("incident_confirmed", "incident_alert_sent"):
-        if not isinstance(state[key], bool):
-            raise InvalidStateError(f"{key} is invalid")
-    parse_utc(state["incident_started_at"])
-    parse_utc(state["last_alert_at"])
-    if state["incident_confirmed"]:
-        required_utc(state["incident_started_at"], "incident_started_at")
-    if state["incident_alert_sent"]:
-        if not state["incident_confirmed"]:
-            raise InvalidStateError("an alert cannot exist without a confirmed incident")
-        required_utc(state["last_alert_at"], "last_alert_at")
-    if state["last_check"] is not None:
-        check = state["last_check"]
-        if not isinstance(check, dict):
-            raise InvalidStateError("last_check is invalid")
-        required_utc(check.get("checked_at"), "last_check.checked_at")
-        if not isinstance(check.get("service_active"), bool):
+def _validate_target_id(target_id: Any) -> None:
+    if target_id == BOINC_TARGET:
+        return
+    if not isinstance(target_id, str):
+        raise InvalidStateError("target ID is not a string")
+    kind, separator, value = target_id.partition(":")
+    if not separator or kind not in TARGET_KINDS or not value:
+        raise InvalidStateError(f"target ID is invalid: {target_id!r}")
+
+
+def _validate_details(target_id: str, details: Any) -> None:
+    if not isinstance(details, dict):
+        raise InvalidStateError(f"{target_id} last_check.details is invalid")
+    kind = target_kind(target_id)
+    if kind == BOINC_TARGET:
+        if not isinstance(details.get("service_active"), bool):
             raise InvalidStateError("last_check.service_active is invalid")
-        if not _is_nonnegative_int(check.get("executing_tasks")):
+        if not _is_nonnegative_int(details.get("executing_tasks")):
             raise InvalidStateError("last_check.executing_tasks is invalid")
-        cpu_percent = check.get("cpu_percent")
+        cpu_percent = details.get("cpu_percent")
         if (
             not isinstance(cpu_percent, (int, float))
             or isinstance(cpu_percent, bool)
@@ -194,30 +206,65 @@ def validate_state(state: Any) -> dict[str, Any]:
             or cpu_percent < 0
         ):
             raise InvalidStateError("last_check.cpu_percent is invalid")
+    elif kind == "service":
+        for key in ("load_state", "active_state", "sub_state"):
+            if not _is_optional_str(details.get(key)):
+                raise InvalidStateError(f"{target_id} last_check.{key} is invalid")
+        for key in ("main_pid", "n_restarts"):
+            value = details.get(key)
+            if value is not None and not _is_nonnegative_int(value):
+                raise InvalidStateError(f"{target_id} last_check.{key} is invalid")
+    elif not _is_nonnegative_int(details.get("count")):
+        raise InvalidStateError(f"{target_id} last_check.count is invalid")
+
+
+def _validate_target(target_id: str, target: Any) -> None:
+    if not isinstance(target, dict):
+        raise InvalidStateError(f"target {target_id} is not an object")
+    missing = set(default_target_state()).difference(target)
+    if missing:
+        raise InvalidStateError(
+            f"target {target_id} is missing keys: {', '.join(sorted(missing))}"
+        )
+    if target["health"] not in HEALTH_ORDER:
+        raise InvalidStateError("health is invalid")
+    for key in ("consecutive_failures", "recoveries_this_incident"):
+        if not _is_nonnegative_int(target[key]):
+            raise InvalidStateError(f"{key} is invalid")
+    for key in ("incident_confirmed", "incident_alert_sent"):
+        if not isinstance(target[key], bool):
+            raise InvalidStateError(f"{key} is invalid")
+    for key in ("incident_started_at", "last_alert_at", "last_recovery_at", "last_restart_alert_at"):
+        parse_utc(target[key])
+    if target["incident_confirmed"]:
+        required_utc(target["incident_started_at"], "incident_started_at")
+    if target["incident_alert_sent"]:
+        if not target["incident_confirmed"]:
+            raise InvalidStateError("an alert cannot exist without a confirmed incident")
+        required_utc(target["last_alert_at"], "last_alert_at")
+    if target["restart_marker"] is not None and not _is_nonnegative_int(target["restart_marker"]):
+        raise InvalidStateError("restart_marker is invalid")
+
+    check = target["last_check"]
+    if check is not None:
+        if not isinstance(check, dict):
+            raise InvalidStateError("last_check is invalid")
+        required_utc(check.get("checked_at"), "last_check.checked_at")
         if not isinstance(check.get("reasons"), list) or not all(
             isinstance(item, str) for item in check["reasons"]
         ):
             raise InvalidStateError("last_check.reasons is invalid")
-    for key in ("pending_recovery", "pending_state_reset_alert"):
-        value = state[key]
-        if value is not None and not isinstance(value, dict):
-            raise InvalidStateError(f"{key} is invalid")
-    if state["pending_recovery"] is not None:
-        required_utc(state["pending_recovery"].get("started_at"), "pending_recovery.started_at")
-        required_utc(
-            state["pending_recovery"].get("recovered_at"), "pending_recovery.recovered_at"
-        )
-    if state["pending_state_reset_alert"] is not None:
-        reset = state["pending_state_reset_alert"]
-        required_utc(reset.get("detected_at"), "pending_state_reset_alert.detected_at")
-        for key in ("backup_name", "error_type"):
-            if not isinstance(reset.get(key), str) or not reset[key]:
-                raise InvalidStateError(f"pending_state_reset_alert.{key} is invalid")
-    if not _is_nonnegative_int(state["recoveries_this_incident"]):
-        raise InvalidStateError("recoveries_this_incident is invalid")
-    parse_utc(state["last_recovery_at"])
-    if state["pending_recovery_alert"] is not None:
-        attempt = state["pending_recovery_alert"]
+        _validate_details(target_id, check.get("details"))
+
+    recovery = target["pending_recovery"]
+    if recovery is not None:
+        if not isinstance(recovery, dict):
+            raise InvalidStateError("pending_recovery is invalid")
+        required_utc(recovery.get("started_at"), "pending_recovery.started_at")
+        required_utc(recovery.get("recovered_at"), "pending_recovery.recovered_at")
+
+    attempt = target["pending_recovery_alert"]
+    if attempt is not None:
         if not isinstance(attempt, dict):
             raise InvalidStateError("pending_recovery_alert is invalid")
         required_utc(attempt.get("attempted_at"), "pending_recovery_alert.attempted_at")
@@ -228,10 +275,158 @@ def validate_state(state: Any) -> dict[str, Any]:
             raise InvalidStateError("pending_recovery_alert.succeeded is invalid")
         if not isinstance(attempt.get("detail"), str):
             raise InvalidStateError("pending_recovery_alert.detail is invalid")
+
+    restart = target["pending_restart"]
+    if restart is not None:
+        if not isinstance(restart, dict):
+            raise InvalidStateError("pending_restart is invalid")
+        if not _is_nonnegative_int(restart.get("count")) or restart["count"] < 1:
+            raise InvalidStateError("pending_restart.count is invalid")
+        required_utc(restart.get("first_at"), "pending_restart.first_at")
+        required_utc(restart.get("last_at"), "pending_restart.last_at")
+        if not isinstance(restart.get("detail"), str):
+            raise InvalidStateError("pending_restart.detail is invalid")
+
+
+def validate_state(state: Any) -> dict[str, Any]:
+    if not isinstance(state, dict):
+        raise InvalidStateError("state root is not an object")
+    required = {
+        "schema_version",
+        "monitor",
+        "boot_id",
+        "targets",
+        "pending_state_reset_alert",
+        "current_week",
+        "pending_weekly",
+    }
+    missing = required.difference(state)
+    if missing:
+        raise InvalidStateError(f"state is missing keys: {', '.join(sorted(missing))}")
+    if state["schema_version"] != SCHEMA_VERSION:
+        raise InvalidStateError("state has the wrong schema after migration")
+    if state["monitor"] not in MONITORS:
+        raise InvalidStateError("monitor is invalid")
+    if not isinstance(state["boot_id"], str):
+        raise InvalidStateError("boot_id is invalid")
+    if not isinstance(state["targets"], dict):
+        raise InvalidStateError("targets is invalid")
+    for target_id, target in state["targets"].items():
+        _validate_target_id(target_id)
+        _validate_target(target_id, target)
+    reset = state["pending_state_reset_alert"]
+    if reset is not None:
+        if not isinstance(reset, dict):
+            raise InvalidStateError("pending_state_reset_alert is invalid")
+        required_utc(reset.get("detected_at"), "pending_state_reset_alert.detected_at")
+        for key in ("backup_name", "error_type"):
+            if not isinstance(reset.get(key), str) or not reset[key]:
+                raise InvalidStateError(f"pending_state_reset_alert.{key} is invalid")
     _validate_counter(state["current_week"])
     if state["pending_weekly"] is not None:
         _validate_counter(state["pending_weekly"], pending=True)
     return state
+
+
+# Keys of the schema 1/2 flat layout, where the single BOINC incident lived at
+# the state root. Schema 3 moves them under targets.boinc.
+_FLAT_INCIDENT_KEYS = (
+    "health",
+    "consecutive_failures",
+    "incident_started_at",
+    "incident_confirmed",
+    "incident_alert_sent",
+    "last_alert_at",
+    "last_check",
+    "pending_recovery",
+    "pending_recovery_alert",
+    "last_recovery_at",
+    "recoveries_this_incident",
+)
+
+
+def _flat_defaults(boot_id: str, now: datetime) -> dict[str, Any]:
+    flat = {key: value for key, value in default_target_state().items() if key in _FLAT_INCIDENT_KEYS}
+    flat.update(
+        boot_id=boot_id,
+        pending_state_reset_alert=None,
+        current_week=_counter_block(week_key(now)),
+        pending_weekly=None,
+    )
+    return flat
+
+
+def _upgrade_schema0(raw: dict[str, Any], boot_id: str, now: datetime) -> dict[str, Any]:
+    # Schema 0 was the pre-release flat-counter format. Preserve every compatible
+    # field, while initializing notification bookkeeping introduced later.
+    flat = _flat_defaults(str(raw.get("boot_id", boot_id)), now)
+    for key in (
+        "health",
+        "consecutive_failures",
+        "incident_started_at",
+        "incident_confirmed",
+        "incident_alert_sent",
+        "last_alert_at",
+        "last_check",
+    ):
+        if key in raw:
+            flat[key] = raw[key]
+    old_week = raw.get("current_week")
+    if old_week is None and any(key in raw for key in ("week", "checks", "failures", "incidents")):
+        old_week = {
+            "week": raw.get("week", week_key(now)),
+            "checks": raw.get("checks", 0),
+            "failures": raw.get("failures", 0),
+            "incidents": raw.get("incidents", 0),
+        }
+    if old_week is not None:
+        flat["current_week"] = old_week
+    return flat
+
+
+def _upgrade_schema1(raw: dict[str, Any]) -> dict[str, Any]:
+    # Schema 2 only added auto-recovery bookkeeping, so every schema 1 field
+    # carries over untouched and the cooldown simply starts unarmed.
+    flat = dict(raw)
+    flat.setdefault("pending_recovery_alert", None)
+    flat.setdefault("last_recovery_at", None)
+    flat.setdefault("recoveries_this_incident", 0)
+    return flat
+
+
+def _upgrade_flat(flat: dict[str, Any]) -> dict[str, Any]:
+    missing = {"boot_id", "current_week", "pending_weekly", "pending_state_reset_alert"}
+    missing.update(_FLAT_INCIDENT_KEYS)
+    missing.difference_update(flat)
+    if missing:
+        raise InvalidStateError(f"state is missing keys: {', '.join(sorted(missing))}")
+    target = default_target_state()
+    for key in _FLAT_INCIDENT_KEYS:
+        target[key] = flat[key]
+    check = flat["last_check"]
+    if isinstance(check, dict) and "details" not in check:
+        target["last_check"] = {
+            "checked_at": check.get("checked_at"),
+            "reasons": check.get("reasons"),
+            "details": {
+                key: check.get(key) for key in ("service_active", "executing_tasks", "cpu_percent")
+            },
+        }
+    counters = []
+    for counter in (flat["current_week"], flat["pending_weekly"]):
+        if isinstance(counter, dict):
+            counter = dict(counter)
+            counter.setdefault("restarts", 0)
+        counters.append(counter)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "monitor": "boinc",
+        "boot_id": flat["boot_id"],
+        "targets": {BOINC_TARGET: target},
+        "pending_state_reset_alert": flat["pending_state_reset_alert"],
+        "current_week": counters[0],
+        "pending_weekly": counters[1],
+    }
 
 
 def migrate_state(raw: Any, boot_id: str, now: datetime) -> dict[str, Any]:
@@ -246,42 +441,15 @@ def migrate_state(raw: Any, boot_id: str, now: datetime) -> dict[str, Any]:
         )
     if version == SCHEMA_VERSION:
         return validate_state(raw)
-
-    if version == 1:
-        # Schema 2 only adds auto-recovery bookkeeping, so every schema 1 field
-        # carries over untouched and the cooldown simply starts unarmed.
-        upgraded = dict(raw)
-        upgraded["schema_version"] = SCHEMA_VERSION
-        upgraded.setdefault("pending_recovery_alert", None)
-        upgraded.setdefault("last_recovery_at", None)
-        upgraded.setdefault("recoveries_this_incident", 0)
-        return validate_state(upgraded)
-
-    # Schema 0 was the pre-release flat-counter format. Preserve every compatible
-    # field, while initializing notification bookkeeping introduced in v1.
-    migrated = default_state(str(raw.get("boot_id", boot_id)), now)
-    for key in (
-        "health",
-        "consecutive_failures",
-        "incident_started_at",
-        "incident_confirmed",
-        "incident_alert_sent",
-        "last_alert_at",
-        "last_check",
-    ):
-        if key in raw:
-            migrated[key] = raw[key]
-    old_week = raw.get("current_week")
-    if old_week is None and any(key in raw for key in ("week", "checks", "failures", "incidents")):
-        old_week = {
-            "week": raw.get("week", week_key(now)),
-            "checks": raw.get("checks", 0),
-            "failures": raw.get("failures", 0),
-            "incidents": raw.get("incidents", 0),
-        }
-    if old_week is not None:
-        migrated["current_week"] = old_week
-    return validate_state(migrated)
+    if version == 0:
+        flat = _upgrade_schema0(raw, boot_id, now)
+    elif version == 1:
+        flat = _upgrade_schema1(raw)
+    else:
+        flat = raw
+    # Schema 3 nests the single BOINC incident under targets.boinc so that
+    # the process monitor can keep one independent incident per target.
+    return validate_state(_upgrade_flat(flat))
 
 
 class StateStore:
@@ -306,7 +474,9 @@ class StateStore:
         finally:
             os.close(descriptor)
 
-    def load(self, boot_id: str, now: datetime) -> tuple[dict[str, Any], Optional[Path]]:
+    def load(
+        self, boot_id: str, now: datetime, monitor: str = "boinc"
+    ) -> tuple[dict[str, Any], Optional[Path]]:
         self._ensure_directory()
         try:
             with self.path.open("r", encoding="utf-8") as handle:
@@ -317,7 +487,7 @@ class StateStore:
                 LOGGER.info("state migrated schema=%s", SCHEMA_VERSION)
             return state, None
         except FileNotFoundError:
-            state = default_state(boot_id, now)
+            state = default_state(boot_id, now, monitor)
             self.save(state)
             LOGGER.info("state initialized")
             return state, None
@@ -327,7 +497,7 @@ class StateStore:
             backup = self._backup_name("corrupt", now)
             os.replace(self.path, backup)
             self._sync_directory()
-            state = default_state(boot_id, now)
+            state = default_state(boot_id, now, monitor)
             state["pending_state_reset_alert"] = {
                 "detected_at": utc_text(now),
                 "backup_name": backup.name,
@@ -368,14 +538,14 @@ class StateStore:
             except FileNotFoundError:
                 pass
 
-    def reset(self, boot_id: str, now: datetime) -> Optional[Path]:
+    def reset(self, boot_id: str, now: datetime, monitor: str = "boinc") -> Optional[Path]:
         self._ensure_directory()
         backup = None
         if self.path.exists():
             backup = self._backup_name("reset", now)
             os.replace(self.path, backup)
             self._sync_directory()
-        self.save(default_state(boot_id, now))
+        self.save(default_state(boot_id, now, monitor))
         return backup
 
 
@@ -410,7 +580,28 @@ class CheckResult:
 
 
 @dataclass
+class TargetResult:
+    """One target's observation, the unit every monitor reports in."""
+
+    target_id: str
+    reasons: list[str]
+    details: dict[str, Any]
+    # Compared against the previous check to detect restarts. None means the
+    # target has nothing to compare right now (for example it is down).
+    restart_marker: Optional[int] = None
+    # False when the query itself failed; the stored marker is then kept.
+    probe_ok: bool = True
+    # None when the recovery action fits this failure, otherwise why not.
+    recovery_hint: Optional[str] = "no recovery action"
+
+    @property
+    def healthy(self) -> bool:
+        return not self.reasons
+
+
+@dataclass
 class Settings:
+    monitor: str = "boinc"
     state_file: Path = Path("/var/lib/sentinel/state.json")
     service_name: str = "boinc-client.service"
     boinccmd: str = "/usr/bin/boinccmd"
@@ -419,6 +610,9 @@ class Settings:
     sample_seconds: float = 10.0
     total_vcpus: float = 2.0
     cpu_threshold: float = 30.0
+    targets_file: Path = Path("/etc/sentinel/targets")
+    proc_root: Path = Path("/proc")
+    systemctl: str = "/usr/bin/systemctl"
     alert_after_failures: int = 2
     reminder_hours: float = 12.0
     telegram_chat_id: str = ""
@@ -438,48 +632,57 @@ class Settings:
             if credential_dir
             else Path("/etc/sentinel/telegram-token")
         )
-        return cls(
-            state_file=Path(os.environ.get("STATE_FILE", "/var/lib/sentinel/state.json")),
-            service_name=os.environ.get("BOINC_SERVICE", "boinc-client.service"),
-            boinccmd=os.environ.get("BOINCCMD", "/usr/bin/boinccmd"),
-            boinc_data_dir=Path(os.environ.get("BOINC_DATA_DIR", "/var/lib/boinc-client")),
-            cgroup_root=Path(os.environ.get("CGROUP_ROOT", "/sys/fs/cgroup")),
-            sample_seconds=float(os.environ.get("SAMPLE_SECONDS", "10")),
-            total_vcpus=float(os.environ.get("TOTAL_VCPUS", "2")),
-            cpu_threshold=float(os.environ.get("CPU_THRESHOLD", "30")),
-            alert_after_failures=int(os.environ.get("ALERT_AFTER_FAILURES", "2")),
-            reminder_hours=float(os.environ.get("REMINDER_HOURS", "12")),
-            telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", "").strip(),
-            telegram_token_file=token_file,
-            command_timeout=float(os.environ.get("COMMAND_TIMEOUT", "8")),
-            recover_enabled=_env_flag("RECOVER_ENABLED", "1"),
-            recover_after_failures=int(os.environ.get("RECOVER_AFTER_FAILURES", "1")),
-            recover_cooldown_hours=float(os.environ.get("RECOVER_COOLDOWN_HOURS", "6")),
-            recover_max_per_incident=int(os.environ.get("RECOVER_MAX_PER_INCIDENT", "2")),
-            recover_timeout=float(os.environ.get("RECOVER_TIMEOUT", "45")),
-        )
+        try:
+            return cls(
+                monitor=os.environ.get("SENTINEL_MONITOR", "boinc").strip().lower() or "boinc",
+                state_file=Path(os.environ.get("STATE_FILE", "/var/lib/sentinel/state.json")),
+                service_name=os.environ.get("BOINC_SERVICE", "boinc-client.service"),
+                boinccmd=os.environ.get("BOINCCMD", "/usr/bin/boinccmd"),
+                boinc_data_dir=Path(os.environ.get("BOINC_DATA_DIR", "/var/lib/boinc-client")),
+                cgroup_root=Path(os.environ.get("CGROUP_ROOT", "/sys/fs/cgroup")),
+                sample_seconds=float(os.environ.get("SAMPLE_SECONDS", "10")),
+                total_vcpus=float(os.environ.get("TOTAL_VCPUS", "2")),
+                cpu_threshold=float(os.environ.get("CPU_THRESHOLD", "30")),
+                targets_file=Path(os.environ.get("TARGETS_FILE", "/etc/sentinel/targets")),
+                alert_after_failures=int(os.environ.get("ALERT_AFTER_FAILURES", "2")),
+                reminder_hours=float(os.environ.get("REMINDER_HOURS", "12")),
+                telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", "").strip(),
+                telegram_token_file=token_file,
+                command_timeout=float(os.environ.get("COMMAND_TIMEOUT", "8")),
+                recover_enabled=_env_flag("RECOVER_ENABLED", "1"),
+                recover_after_failures=int(os.environ.get("RECOVER_AFTER_FAILURES", "1")),
+                recover_cooldown_hours=float(os.environ.get("RECOVER_COOLDOWN_HOURS", "6")),
+                recover_max_per_incident=int(os.environ.get("RECOVER_MAX_PER_INCIDENT", "2")),
+                recover_timeout=float(os.environ.get("RECOVER_TIMEOUT", "45")),
+            )
+        except ValueError as exc:
+            raise ConfigError(f"invalid setting: {exc}") from exc
 
     def validate(self) -> None:
-        if not math.isfinite(self.sample_seconds) or self.sample_seconds <= 0:
-            raise ValueError("SAMPLE_SECONDS must be positive")
-        if not math.isfinite(self.total_vcpus) or self.total_vcpus <= 0:
-            raise ValueError("TOTAL_VCPUS must be positive")
-        if not math.isfinite(self.cpu_threshold) or not 0 <= self.cpu_threshold <= 100:
-            raise ValueError("CPU_THRESHOLD must be between 0 and 100")
+        if self.monitor not in MONITORS:
+            raise ConfigError(f"SENTINEL_MONITOR must be one of: {', '.join(MONITORS)}")
         if self.alert_after_failures < 1:
-            raise ValueError("ALERT_AFTER_FAILURES must be at least 1")
+            raise ConfigError("ALERT_AFTER_FAILURES must be at least 1")
         if not math.isfinite(self.reminder_hours) or self.reminder_hours <= 0:
-            raise ValueError("REMINDER_HOURS must be positive")
+            raise ConfigError("REMINDER_HOURS must be positive")
         if not math.isfinite(self.command_timeout) or self.command_timeout <= 0:
-            raise ValueError("COMMAND_TIMEOUT must be positive")
+            raise ConfigError("COMMAND_TIMEOUT must be positive")
         if self.recover_after_failures < 1:
-            raise ValueError("RECOVER_AFTER_FAILURES must be at least 1")
+            raise ConfigError("RECOVER_AFTER_FAILURES must be at least 1")
         if self.recover_max_per_incident < 1:
-            raise ValueError("RECOVER_MAX_PER_INCIDENT must be at least 1")
+            raise ConfigError("RECOVER_MAX_PER_INCIDENT must be at least 1")
         if not math.isfinite(self.recover_cooldown_hours) or self.recover_cooldown_hours <= 0:
-            raise ValueError("RECOVER_COOLDOWN_HOURS must be positive")
+            raise ConfigError("RECOVER_COOLDOWN_HOURS must be positive")
         if not math.isfinite(self.recover_timeout) or self.recover_timeout <= 0:
-            raise ValueError("RECOVER_TIMEOUT must be positive")
+            raise ConfigError("RECOVER_TIMEOUT must be positive")
+        if self.monitor != "boinc":
+            return
+        if not math.isfinite(self.sample_seconds) or self.sample_seconds <= 0:
+            raise ConfigError("SAMPLE_SECONDS must be positive")
+        if not math.isfinite(self.total_vcpus) or self.total_vcpus <= 0:
+            raise ConfigError("TOTAL_VCPUS must be positive")
+        if not math.isfinite(self.cpu_threshold) or not 0 <= self.cpu_threshold <= 100:
+            raise ConfigError("CPU_THRESHOLD must be between 0 and 100")
 
 
 class BoincProbe:
@@ -636,6 +839,312 @@ class RecoveryRunner:
         return True, "acct_mgr sync ok"
 
 
+def boinc_target_result(result: CheckResult, threshold: float) -> TargetResult:
+    return TargetResult(
+        target_id=BOINC_TARGET,
+        reasons=result.reasons(threshold),
+        details={
+            "service_active": result.service_active,
+            "executing_tasks": result.executing_tasks,
+            "cpu_percent": result.cpu_percent,
+        },
+        recovery_hint=None if result.starved() else "failure is not a work shortage",
+    )
+
+
+class BoincMonitor:
+    """Option 1: the single BOINC target, recovered by account manager sync."""
+
+    name = "boinc"
+
+    def __init__(self, settings: Settings, probe: Any = None, recovery: Any = None):
+        self.settings = settings
+        self.probe = probe if probe is not None else BoincProbe(settings)
+        self.recovery = recovery if recovery is not None else RecoveryRunner(settings)
+
+    def target_ids(self) -> list[str]:
+        return [BOINC_TARGET]
+
+    def check(self) -> list[TargetResult]:
+        return [boinc_target_result(self.probe.measure(), self.settings.cpu_threshold)]
+
+    def recover(self, target_id: str) -> tuple[bool, str]:
+        return self.recovery.run()
+
+
+@dataclass(frozen=True)
+class Target:
+    kind: str
+    value: str
+    pattern: Optional[re.Pattern[str]] = field(default=None, compare=False)
+
+    @property
+    def target_id(self) -> str:
+        return f"{self.kind}:{self.value}"
+
+
+def _normalize_unit(value: str, number: int) -> str:
+    if value.startswith("-") or not UNIT_NAME_RE.match(value):
+        raise ConfigError(f"targets line {number}: invalid unit name {value!r}")
+    suffix = value.rsplit(".", 1)[1] if "." in value else ""
+    if suffix == "service":
+        return value
+    if suffix in OTHER_UNIT_TYPES:
+        raise ConfigError(f"targets line {number}: only .service units are supported: {value!r}")
+    return f"{value}.service"
+
+
+def parse_targets(text: str) -> list[Target]:
+    targets: list[Target] = []
+    seen: set[str] = set()
+    for number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        kind = parts[0]
+        value = parts[1].strip() if len(parts) > 1 else ""
+        if kind not in TARGET_KINDS:
+            raise ConfigError(f"targets line {number}: unknown kind {kind!r}")
+        if not value:
+            raise ConfigError(f"targets line {number}: {kind} needs a value")
+        pattern = None
+        if kind == "service":
+            value = _normalize_unit(value, number)
+        elif kind == "cmdline":
+            try:
+                pattern = re.compile(value)
+            except re.error as exc:
+                raise ConfigError(f"targets line {number}: invalid regex: {exc}") from exc
+        target = Target(kind, value, pattern)
+        if target.target_id in seen:
+            raise ConfigError(f"targets line {number}: duplicate target {target.target_id}")
+        seen.add(target.target_id)
+        targets.append(target)
+    if not targets:
+        raise ConfigError("targets file has no targets")
+    return targets
+
+
+def load_targets(path: Path) -> list[Target]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ConfigError(f"targets file not found: {path}") from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"targets file unreadable: {path}: {type(exc).__name__}") from exc
+    return parse_targets(text)
+
+
+@dataclass
+class ProcessInfo:
+    pid: int
+    comm: str
+    argv: list[str]
+    start_ticks: int
+
+
+def scan_processes(proc_root: Path, exclude: set[int]) -> list[ProcessInfo]:
+    """List live user-space processes from /proc.
+
+    Only world-readable files are used. The unit runs as root without
+    capabilities, so /proc/<pid>/exe of other users' processes is off limits.
+    """
+    processes: list[ProcessInfo] = []
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid in exclude:
+            continue
+        try:
+            stat = (entry / "stat").read_text(encoding="utf-8", errors="replace")
+            cmdline = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue  # Exited mid-scan.
+        head, separator, tail = stat.rpartition(")")
+        if not separator:
+            continue
+        fields = tail.split()
+        # Fields after the comm start at field 3 (state); starttime is field 22.
+        if len(fields) < 20 or fields[0] == "Z":
+            continue
+        try:
+            start_ticks = int(fields[19])
+        except ValueError:
+            continue
+        argv = [part.decode("utf-8", "replace") for part in cmdline.split(b"\0")]
+        while argv and not argv[-1]:
+            argv.pop()
+        if not argv:
+            continue  # Kernel threads have no command line.
+        processes.append(ProcessInfo(pid, head.partition("(")[2], argv, start_ticks))
+    return processes
+
+
+def process_matches(target: Target, process: ProcessInfo) -> bool:
+    if target.kind == "cmdline":
+        assert target.pattern is not None
+        return target.pattern.search(" ".join(process.argv)) is not None
+    name = target.value
+    if process.comm == name:
+        return True
+    if len(name) > COMM_LENGTH and process.comm == name[:COMM_LENGTH]:
+        return True
+    return os.path.basename(process.argv[0]) == name
+
+
+def _optional_int(value: Optional[str]) -> Optional[int]:
+    try:
+        parsed = int(value) if value is not None else None
+    except ValueError:
+        return None
+    return parsed if parsed is not None and parsed >= 0 else None
+
+
+class ProcessMonitor:
+    """Option 2: registered systemd services and processes.
+
+    Each target is alive or not, and a restart since the previous check is
+    reported separately. Only service targets have a recovery action.
+    """
+
+    name = "process"
+    SERVICE_PROPERTIES = ("LoadState", "ActiveState", "SubState", "MainPID", "NRestarts")
+
+    def __init__(
+        self,
+        settings: Settings,
+        targets: list[Target],
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        self_pid: Optional[int] = None,
+    ):
+        self.settings = settings
+        self.targets = targets
+        self.runner = runner
+        self.self_pid = os.getpid() if self_pid is None else self_pid
+
+    def target_ids(self) -> list[str]:
+        return [target.target_id for target in self.targets]
+
+    def _systemctl(self, args: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        return self.runner(
+            [self.settings.systemctl, *args],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+
+    def _check_service(self, target: Target) -> TargetResult:
+        properties: dict[str, str] = {}
+        errors: list[str] = []
+        try:
+            # --value would drop the names, so parse Key=Value lines instead.
+            result = self._systemctl(
+                ["show", f"--property={','.join(self.SERVICE_PROPERTIES)}", "--", target.value],
+                self.settings.command_timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(f"service query {type(exc).__name__}")
+        else:
+            if result.returncode != 0:
+                errors.append(f"service query exit {result.returncode}")
+            else:
+                for line in result.stdout.splitlines():
+                    key, separator, value = line.partition("=")
+                    if separator:
+                        properties[key.strip()] = value.strip()
+                if not {"LoadState", "ActiveState"}.issubset(properties):
+                    errors.append("service query incomplete")
+
+        details = {
+            "load_state": properties.get("LoadState"),
+            "active_state": properties.get("ActiveState"),
+            "sub_state": properties.get("SubState"),
+            "main_pid": _optional_int(properties.get("MainPID")),
+            "n_restarts": _optional_int(properties.get("NRestarts")),
+        }
+        if errors:
+            return TargetResult(
+                target.target_id, errors, details, probe_ok=False, recovery_hint="probe error"
+            )
+        reasons: list[str] = []
+        hint: Optional[str] = None
+        if details["load_state"] != "loaded":
+            reasons.append(f"LoadState={details['load_state']}")
+            hint = "unit is not loaded"
+        elif details["active_state"] != "active":
+            reasons.append(f"ActiveState={details['active_state']}")
+            # Only a crashed unit is restarted. inactive usually means an
+            # administrator stopped it, and activating/deactivating means
+            # systemd is already acting on it.
+            if details["active_state"] != "failed":
+                hint = f"ActiveState={details['active_state']} is not failed"
+        return TargetResult(
+            target.target_id,
+            reasons,
+            details,
+            restart_marker=details["n_restarts"],
+            recovery_hint=hint,
+        )
+
+    def _check_processes(self, targets: list[Target]) -> list[TargetResult]:
+        try:
+            processes = scan_processes(self.settings.proc_root, {self.self_pid})
+        except OSError as exc:
+            error = f"process scan {type(exc).__name__}"
+            return [
+                TargetResult(
+                    target.target_id,
+                    [error],
+                    {"count": 0},
+                    probe_ok=False,
+                    recovery_hint="probe error",
+                )
+                for target in targets
+            ]
+        results = []
+        for target in targets:
+            matches = [process for process in processes if process_matches(target, process)]
+            results.append(
+                TargetResult(
+                    target.target_id,
+                    [] if matches else ["no matching process"],
+                    {"count": len(matches)},
+                    # The oldest match changes only when the original process is gone.
+                    restart_marker=min(process.start_ticks for process in matches) if matches else None,
+                    recovery_hint="process targets have no restart action",
+                )
+            )
+        return results
+
+    def check(self) -> list[TargetResult]:
+        by_id: dict[str, TargetResult] = {}
+        process_targets = [target for target in self.targets if target.kind != "service"]
+        if process_targets:
+            for result in self._check_processes(process_targets):
+                by_id[result.target_id] = result
+        for target in self.targets:
+            if target.kind == "service":
+                by_id[target.target_id] = self._check_service(target)
+        return [by_id[target.target_id] for target in self.targets]
+
+    def recover(self, target_id: str) -> tuple[bool, str]:
+        unit = target_id.partition(":")[2]
+        # reset-failed clears a start-limit hit that would refuse the restart.
+        # Sentinel's own cooldown and per-incident budget replace that limit.
+        for verb in ("reset-failed", "restart"):
+            try:
+                result = self._systemctl([verb, "--", unit], self.settings.recover_timeout)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                return False, f"systemctl {verb} {type(exc).__name__}"
+            if result.returncode != 0:
+                return False, f"systemctl {verb} exit {result.returncode}"
+        return True, "systemctl restart ok"
+
+
 class TelegramNotifier:
     def __init__(self, chat_id: str, token_file: Optional[Path], timeout: float = 10.0):
         self.chat_id = chat_id
@@ -685,15 +1194,13 @@ def rotate_week(state: dict[str, Any], now: datetime) -> None:
         pending = {
             "start_week": current["week"],
             "end_week": current["week"],
-            "checks": current["checks"],
-            "failures": current["failures"],
-            "incidents": current["incidents"],
             "due_at": utc_text(weekly_due(now)),
         }
+        pending.update({key: current[key] for key in COUNTER_KEYS})
     else:
         # A long Telegram outage must not grow state forever or discard counters.
         pending["end_week"] = current["week"]
-        for key in ("checks", "failures", "incidents"):
+        for key in COUNTER_KEYS:
             pending[key] += current[key]
     state["pending_weekly"] = pending
     state["current_week"] = _counter_block(new_key)
@@ -704,58 +1211,113 @@ def handle_boot_change(state: dict[str, Any], boot_id: str) -> bool:
         return False
     previous = state["boot_id"]
     state["boot_id"] = boot_id
-    state["consecutive_failures"] = 0
-    state["recoveries_this_incident"] = 0
+    for target in state["targets"].values():
+        target["consecutive_failures"] = 0
+        target["recoveries_this_incident"] = 0
+        # Every service and process starts over on boot; that is not a restart.
+        target["restart_marker"] = None
     LOGGER.info("boot ID changed previous=%s current=%s failure_streak_reset=true", previous, boot_id)
     return True
 
 
-def apply_check(state: dict[str, Any], result: CheckResult, now: datetime, threshold: float, alert_after: int) -> None:
-    reasons = result.reasons(threshold)
-    healthy = not reasons
+def sync_targets(state: dict[str, Any], monitor: str, target_ids: list[str]) -> None:
+    if state["monitor"] != monitor:
+        LOGGER.info("monitor changed previous=%s current=%s", state["monitor"], monitor)
+        state["monitor"] = monitor
+    targets = state["targets"]
+    for target_id in list(targets):
+        if target_id not in target_ids:
+            del targets[target_id]
+            LOGGER.info("target no longer configured, state dropped target=%s", target_id)
+    for target_id in target_ids:
+        targets.setdefault(target_id, default_target_state())
+
+
+def restart_change(
+    target_id: str, previous: Optional[int], current: Optional[int]
+) -> Optional[tuple[int, str]]:
+    if previous is None or current is None:
+        return None
+    if target_kind(target_id) == "service":
+        # NRestarts counts Restart= restarts only and drops back to 0 on a
+        # manual start, so only an increase is a crash restart.
+        if current > previous:
+            return current - previous, f"NRestarts {previous}→{current}"
+        return None
+    if current != previous:
+        return 1, "가장 오래된 프로세스 시작 시각 변경"
+    return None
+
+
+def apply_result(
+    state: dict[str, Any],
+    result: TargetResult,
+    now: datetime,
+    alert_after: int,
+) -> None:
+    target = state["targets"][result.target_id]
     counter = state["current_week"]
-    counter["checks"] += 1
-    state["last_check"] = {
+    target["last_check"] = {
         "checked_at": utc_text(now),
-        "service_active": result.service_active,
-        "executing_tasks": result.executing_tasks,
-        "cpu_percent": result.cpu_percent,
-        "reasons": reasons,
+        "reasons": list(result.reasons),
+        "details": dict(result.details),
     }
 
-    if healthy:
-        if state["incident_confirmed"] and state["incident_alert_sent"]:
-            state["pending_recovery"] = {
-                "started_at": state["incident_started_at"],
+    if result.probe_ok:
+        change = restart_change(result.target_id, target["restart_marker"], result.restart_marker)
+        target["restart_marker"] = result.restart_marker
+        if change is not None:
+            count, detail = change
+            counter["restarts"] += count
+            pending = target["pending_restart"]
+            if pending is None:
+                target["pending_restart"] = {
+                    "count": count,
+                    "first_at": utc_text(now),
+                    "last_at": utc_text(now),
+                    "detail": detail,
+                }
+            else:
+                pending["count"] += count
+                pending["last_at"] = utc_text(now)
+                pending["detail"] = detail
+            LOGGER.warning(
+                "restart detected target=%s count=%d detail=%s", result.target_id, count, detail
+            )
+
+    if result.healthy:
+        if target["incident_confirmed"] and target["incident_alert_sent"]:
+            target["pending_recovery"] = {
+                "started_at": target["incident_started_at"],
                 "recovered_at": utc_text(now),
             }
-        state["health"] = "healthy"
-        state["consecutive_failures"] = 0
-        state["recoveries_this_incident"] = 0
-        state["incident_started_at"] = None
-        state["incident_confirmed"] = False
-        state["incident_alert_sent"] = False
-        state["last_alert_at"] = None
+        target["health"] = "healthy"
+        target["consecutive_failures"] = 0
+        target["recoveries_this_incident"] = 0
+        target["incident_started_at"] = None
+        target["incident_confirmed"] = False
+        target["incident_alert_sent"] = False
+        target["last_alert_at"] = None
         return
 
     counter["failures"] += 1
-    state["consecutive_failures"] += 1
-    if state["incident_started_at"] is None:
-        state["incident_started_at"] = utc_text(now)
-    if state["incident_confirmed"]:
-        state["health"] = "unhealthy"
-    elif state["consecutive_failures"] >= alert_after:
-        state["incident_confirmed"] = True
-        state["health"] = "unhealthy"
+    target["consecutive_failures"] += 1
+    if target["incident_started_at"] is None:
+        target["incident_started_at"] = utc_text(now)
+    if target["incident_confirmed"]:
+        target["health"] = "unhealthy"
+    elif target["consecutive_failures"] >= alert_after:
+        target["incident_confirmed"] = True
+        target["health"] = "unhealthy"
         counter["incidents"] += 1
     else:
-        state["health"] = "degraded"
+        target["health"] = "degraded"
 
 
 def recovery_block_reason(
-    state: dict[str, Any],
-    result: CheckResult,
-    settings: "Settings",
+    target: dict[str, Any],
+    result: TargetResult,
+    settings: Settings,
     now: datetime,
 ) -> Optional[str]:
     """Return None when auto-recovery may run, otherwise why it must not.
@@ -765,21 +1327,21 @@ def recovery_block_reason(
     """
     if not settings.recover_enabled:
         return "disabled"
-    if result.healthy(settings.cpu_threshold):
+    if result.healthy:
         return "check is healthy"
-    if not result.starved():
-        return "failure is not a work shortage"
-    if state["consecutive_failures"] < settings.recover_after_failures:
+    if result.recovery_hint is not None:
+        return result.recovery_hint
+    if target["consecutive_failures"] < settings.recover_after_failures:
         return (
-            f"failure streak {state['consecutive_failures']} "
+            f"failure streak {target['consecutive_failures']} "
             f"< {settings.recover_after_failures}"
         )
-    if state["recoveries_this_incident"] >= settings.recover_max_per_incident:
+    if target["recoveries_this_incident"] >= settings.recover_max_per_incident:
         return (
             f"incident budget spent "
-            f"{state['recoveries_this_incident']}/{settings.recover_max_per_incident}"
+            f"{target['recoveries_this_incident']}/{settings.recover_max_per_incident}"
         )
-    last = parse_utc(state["last_recovery_at"])
+    last = parse_utc(target["last_recovery_at"])
     if last is not None:
         cooldown = timedelta(hours=settings.recover_cooldown_hours)
         if now - last < cooldown:
@@ -797,22 +1359,125 @@ def _health_label(value: str) -> str:
     }[value]
 
 
-def _last_check_summary(state: dict[str, Any]) -> str:
-    check = state["last_check"]
+def _show(value: Any) -> str:
+    return "?" if value is None else str(value)
+
+
+def _last_check_summary(target_id: str, target: dict[str, Any]) -> str:
+    check = target["last_check"]
     if check is None:
         return "측정값 없음"
     reasons = ", ".join(check["reasons"]) if check["reasons"] else "없음"
-    active = "active" if check["service_active"] else "inactive"
-    return (
-        f"service={active}, EXECUTING={check['executing_tasks']}, "
-        f"CPU={check['cpu_percent']:.1f}%, 원인={reasons}"
-    )
+    details = check["details"]
+    kind = target_kind(target_id)
+    if kind == BOINC_TARGET:
+        active = "active" if details["service_active"] else "inactive"
+        return (
+            f"service={active}, EXECUTING={details['executing_tasks']}, "
+            f"CPU={details['cpu_percent']:.1f}%, 원인={reasons}"
+        )
+    if kind == "service":
+        return (
+            f"ActiveState={_show(details.get('active_state'))}, "
+            f"SubState={_show(details.get('sub_state'))}, "
+            f"NRestarts={_show(details.get('n_restarts'))}, 원인={reasons}"
+        )
+    return f"프로세스={details['count']}개, 원인={reasons}"
 
 
 @dataclass
 class Notification:
     kind: str
     message: str
+    target_id: Optional[str] = None
+
+
+def _target_notifications(
+    target_id: str,
+    target: dict[str, Any],
+    now: datetime,
+    hostname: str,
+    reminder_hours: float,
+) -> list[Notification]:
+    # BOINC keeps its original wording; process targets name the target.
+    boinc = target_id == BOINC_TARGET
+    subject = hostname if boinc else f"{hostname} {target_id}"
+    summary = _last_check_summary(target_id, target)
+    notifications: list[Notification] = []
+
+    recovery = target["pending_recovery"]
+    if recovery is not None:
+        if boinc:
+            message = (
+                f"✅ Sentinel 복구: {hostname}의 BOINC가 정상화되었습니다. "
+                f"장애 시작={recovery['started_at']}, 복구={recovery['recovered_at']}; {summary}"
+            )
+        else:
+            message = (
+                f"✅ Sentinel 복구: {subject}; "
+                f"장애 시작={recovery['started_at']}, 복구={recovery['recovered_at']}; {summary}"
+            )
+        notifications.append(Notification("recovery", message, target_id))
+
+    attempt = target["pending_recovery_alert"]
+    if attempt is not None:
+        outcome = "성공" if attempt["succeeded"] else "실패"
+        progress = f"({attempt['attempt']}/{attempt['max_attempts']}회차, {attempt['detail']})"
+        if boinc:
+            message = (
+                f"🔧 Sentinel 자동복구 {outcome}: {hostname}에서 "
+                f"boinccmd --acct_mgr sync 실행 {progress}; {summary}"
+            )
+        else:
+            message = (
+                f"🔧 Sentinel 자동복구 {outcome}: {subject}; "
+                f"systemctl restart 실행 {progress}; {summary}"
+            )
+        notifications.append(Notification("recovery_attempt", message, target_id))
+
+    restart = target["pending_restart"]
+    if restart is not None:
+        # A crash loop is announced once, then only counted until the
+        # reminder window passes and the total goes out in one message.
+        last_sent = parse_utc(target["last_restart_alert_at"])
+        if last_sent is None or now - last_sent >= timedelta(hours=reminder_hours):
+            period = restart["first_at"]
+            if restart["last_at"] != restart["first_at"]:
+                period = f"{restart['first_at']}~{restart['last_at']}"
+            notifications.append(
+                Notification(
+                    "restart",
+                    f"🔁 Sentinel 재시작: {subject}; 재시작={restart['count']}회, "
+                    f"감지={period}, {restart['detail']}; {summary}",
+                    target_id,
+                )
+            )
+
+    if target["incident_confirmed"]:
+        last_alert = parse_utc(target["last_alert_at"])
+        due = not target["incident_alert_sent"]
+        kind = "incident"
+        if last_alert is not None and now - last_alert >= timedelta(hours=reminder_hours):
+            due = True
+            kind = "reminder"
+        if due:
+            prefix = "🚨 Sentinel 장애" if kind == "incident" else "🚨 Sentinel 장애 지속"
+            notifications.append(
+                Notification(
+                    kind,
+                    f"{prefix}: {subject}; 시작={target['incident_started_at']}, "
+                    f"연속 실패={target['consecutive_failures']}회; {summary}",
+                    target_id,
+                )
+            )
+    return notifications
+
+
+def overall_health(state: dict[str, Any]) -> str:
+    healths = [target["health"] for target in state["targets"].values()]
+    if not healths:
+        return "unknown"
+    return max(healths, key=HEALTH_ORDER.index)
 
 
 def pending_notifications(
@@ -829,75 +1494,60 @@ def pending_notifications(
             )
         )
 
-    recovery = state["pending_recovery"]
-    if recovery is not None:
-        notifications.append(
-            Notification(
-                "recovery",
-                f"✅ Sentinel 복구: {hostname}의 BOINC가 정상화되었습니다. "
-                f"장애 시작={recovery['started_at']}, 복구={recovery['recovered_at']}; "
-                f"{_last_check_summary(state)}",
-            )
+    for target_id, target in state["targets"].items():
+        notifications.extend(
+            _target_notifications(target_id, target, now, hostname, reminder_hours)
         )
-
-    attempt = state["pending_recovery_alert"]
-    if attempt is not None:
-        outcome = "성공" if attempt["succeeded"] else "실패"
-        notifications.append(
-            Notification(
-                "recovery_attempt",
-                f"🔧 Sentinel 자동복구 {outcome}: {hostname}에서 "
-                f"boinccmd --acct_mgr sync 실행 "
-                f"({attempt['attempt']}/{attempt['max_attempts']}회차, "
-                f"{attempt['detail']}); {_last_check_summary(state)}",
-            )
-        )
-
-    if state["incident_confirmed"]:
-        last_alert = parse_utc(state["last_alert_at"])
-        due = not state["incident_alert_sent"]
-        kind = "incident"
-        if last_alert is not None and now - last_alert >= timedelta(hours=reminder_hours):
-            due = True
-            kind = "reminder"
-        if due:
-            prefix = "🚨 Sentinel 장애" if kind == "incident" else "🚨 Sentinel 장애 지속"
-            notifications.append(
-                Notification(
-                    kind,
-                    f"{prefix}: {hostname}; 시작={state['incident_started_at']}, "
-                    f"연속 실패={state['consecutive_failures']}회; {_last_check_summary(state)}",
-                )
-            )
 
     weekly = state["pending_weekly"]
     if weekly is not None and now >= parse_utc(weekly["due_at"]):
         period = weekly["start_week"]
         if weekly["end_week"] != weekly["start_week"]:
             period = f"{weekly['start_week']}~{weekly['end_week']}"
-        notifications.append(
-            Notification(
-                "weekly",
-                f"📊 Sentinel 주간 요약: {hostname} {period} "
-                f"점검={weekly['checks']} 실패={weekly['failures']} 장애={weekly['incidents']} "
-                f"현재={_health_label(state['health'])}",
+        counts = f"점검={weekly['checks']} 실패={weekly['failures']} 장애={weekly['incidents']}"
+        current = _health_label(overall_health(state))
+        if state["monitor"] == "boinc":
+            message = f"📊 Sentinel 주간 요약: {hostname} {period} {counts} 현재={current}"
+        else:
+            message = (
+                f"📊 Sentinel 주간 요약: {hostname} {period} {counts} "
+                f"재시작={weekly['restarts']} 현재={current}"
             )
-        )
+            unhealthy = [
+                target_id
+                for target_id, target in state["targets"].items()
+                if target["health"] == "unhealthy"
+            ]
+            if unhealthy:
+                message += f"; 장애 대상={', '.join(unhealthy)}"
+        notifications.append(Notification("weekly", message))
     return notifications
 
 
 def mark_notification_sent(state: dict[str, Any], notification: Notification, now: datetime) -> None:
     if notification.kind == "state_reset":
         state["pending_state_reset_alert"] = None
-    elif notification.kind == "recovery":
-        state["pending_recovery"] = None
-    elif notification.kind == "recovery_attempt":
-        state["pending_recovery_alert"] = None
-    elif notification.kind in {"incident", "reminder"}:
-        state["incident_alert_sent"] = True
-        state["last_alert_at"] = utc_text(now)
-    elif notification.kind == "weekly":
+        return
+    if notification.kind == "weekly":
         state["pending_weekly"] = None
+        return
+    target = state["targets"].get(notification.target_id or "")
+    if target is None:
+        return
+    if notification.kind == "recovery":
+        target["pending_recovery"] = None
+    elif notification.kind == "recovery_attempt":
+        target["pending_recovery_alert"] = None
+    elif notification.kind == "restart":
+        target["pending_restart"] = None
+        target["last_restart_alert_at"] = utc_text(now)
+    elif notification.kind in {"incident", "reminder"}:
+        target["incident_alert_sent"] = True
+        target["last_alert_at"] = utc_text(now)
+
+
+def _details_text(details: dict[str, Any]) -> str:
+    return " ".join(f"{key}={value}" for key, value in details.items())
 
 
 class Sentinel:
@@ -905,38 +1555,38 @@ class Sentinel:
         self,
         settings: Settings,
         store: StateStore,
-        probe: BoincProbe,
+        monitor: Any,
         notifier: TelegramNotifier,
         hostname: str,
         boot_id_reader: Callable[[], str] = read_boot_id,
-        recovery: Optional[RecoveryRunner] = None,
     ):
         self.settings = settings
         self.store = store
-        self.probe = probe
+        self.monitor = monitor
         self.notifier = notifier
         self.hostname = hostname
         self.boot_id_reader = boot_id_reader
-        self.recovery = recovery if recovery is not None else RecoveryRunner(settings)
 
-    def _attempt_recovery(self, state: dict[str, Any], now: datetime) -> None:
+    def _attempt_recovery(self, state: dict[str, Any], target_id: str, now: datetime) -> None:
+        target = state["targets"][target_id]
         # Write-ahead. The cooldown is burned and committed before the command
-        # runs, so a crash or a kill mid-sync still costs one attempt rather
-        # than leaving the next check free to detach projects all over again.
-        state["last_recovery_at"] = utc_text(now)
-        state["recoveries_this_incident"] += 1
-        attempt = state["recoveries_this_incident"]
+        # runs, so a crash or a kill mid-run still costs one attempt rather
+        # than leaving the next check free to act all over again.
+        target["last_recovery_at"] = utc_text(now)
+        target["recoveries_this_incident"] += 1
+        attempt = target["recoveries_this_incident"]
         self.store.save(state)
 
-        succeeded, detail = self.recovery.run()
+        succeeded, detail = self.monitor.recover(target_id)
         LOGGER.warning(
-            "auto-recovery ran attempt=%d/%d succeeded=%s detail=%s",
+            "auto-recovery ran target=%s attempt=%d/%d succeeded=%s detail=%s",
+            target_id,
             attempt,
             self.settings.recover_max_per_incident,
             succeeded,
             detail,
         )
-        state["pending_recovery_alert"] = {
+        target["pending_recovery_alert"] = {
             "attempted_at": utc_text(now),
             "attempt": attempt,
             "max_attempts": self.settings.recover_max_per_incident,
@@ -948,39 +1598,37 @@ class Sentinel:
     def check(self, now: Optional[datetime] = None) -> int:
         now = now or utc_now()
         boot_id = self.boot_id_reader()
-        state, _ = self.store.load(boot_id, now)
+        state, _ = self.store.load(boot_id, now, self.monitor.name)
         handle_boot_change(state, boot_id)
         rotate_week(state, now)
+        sync_targets(state, self.monitor.name, self.monitor.target_ids())
 
-        result = self.probe.measure()
-        apply_check(
-            state,
-            result,
-            now,
-            self.settings.cpu_threshold,
-            self.settings.alert_after_failures,
-        )
-        LOGGER.info(
-            "check health=%s service_active=%s executing_tasks=%d cpu_percent=%.2f "
-            "threshold=%.2f consecutive_failures=%d reasons=%s",
-            state["health"],
-            result.service_active,
-            result.executing_tasks,
-            result.cpu_percent,
-            self.settings.cpu_threshold,
-            state["consecutive_failures"],
-            "; ".join(state["last_check"]["reasons"]) or "none",
-        )
+        results = self.monitor.check()
+        state["current_week"]["checks"] += 1
+        for result in results:
+            apply_result(state, result, now, self.settings.alert_after_failures)
+            target = state["targets"][result.target_id]
+            LOGGER.info(
+                "check target=%s health=%s consecutive_failures=%d %s reasons=%s",
+                result.target_id,
+                target["health"],
+                target["consecutive_failures"],
+                _details_text(result.details),
+                "; ".join(result.reasons) or "none",
+            )
 
         # Commit the observation before attempting external side effects. Each
         # successful notification is then committed separately for retry safety.
         self.store.save(state)
 
-        blocked = recovery_block_reason(state, result, self.settings, now)
-        if blocked is None:
-            self._attempt_recovery(state, now)
-        elif not result.healthy(self.settings.cpu_threshold):
-            LOGGER.info("auto-recovery not run: %s", blocked)
+        for result in results:
+            blocked = recovery_block_reason(
+                state["targets"][result.target_id], result, self.settings, now
+            )
+            if blocked is None:
+                self._attempt_recovery(state, result.target_id, now)
+            elif not result.healthy:
+                LOGGER.info("auto-recovery not run target=%s: %s", result.target_id, blocked)
 
         for notification in pending_notifications(
             state, now, self.hostname, self.settings.reminder_hours
@@ -988,21 +1636,40 @@ class Sentinel:
             if self.notifier.send(notification.message):
                 mark_notification_sent(state, notification, now)
                 self.store.save(state)
-                LOGGER.info("notification sent kind=%s", notification.kind)
+                LOGGER.info(
+                    "notification sent kind=%s target=%s", notification.kind, notification.target_id
+                )
             else:
-                LOGGER.warning("notification pending kind=%s", notification.kind)
+                LOGGER.warning(
+                    "notification pending kind=%s target=%s", notification.kind, notification.target_id
+                )
         return 0
+
+
+def build_monitor(settings: Settings) -> Any:
+    if settings.monitor == "boinc":
+        return BoincMonitor(settings)
+    return ProcessMonitor(settings, load_targets(settings.targets_file))
 
 
 def build_sentinel(settings: Settings) -> Sentinel:
     return Sentinel(
         settings=settings,
         store=StateStore(settings.state_file),
-        probe=BoincProbe(settings),
+        monitor=build_monitor(settings),
         notifier=TelegramNotifier(settings.telegram_chat_id, settings.telegram_token_file),
         hostname=socket.gethostname(),
-        recovery=RecoveryRunner(settings),
     )
+
+
+def check_config(settings: Settings, monitor: Any, out: Callable[[str], None] = print) -> int:
+    """Print each target's current status without touching the state file."""
+    out(f"monitor={monitor.name} targets={len(monitor.target_ids())}")
+    for result in monitor.check():
+        status = "ok  " if result.healthy else "FAIL"
+        reasons = "; ".join(result.reasons) or "none"
+        out(f"{status} {result.target_id} {_details_text(result.details)} reasons={reasons}")
+    return 0
 
 
 def configure_logging(verbose: bool = False) -> None:
@@ -1016,7 +1683,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--verbose", action="store_true")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("check", help="run one BOINC health check")
+    subparsers.add_parser("check", help="run one health check")
+    subparsers.add_parser(
+        "check-config", help="validate settings and targets and print current status"
+    )
     subparsers.add_parser("show-state", help="print the current state snapshot")
     reset_parser = subparsers.add_parser("reset-state", help="backup and reset state")
     reset_parser.add_argument(
@@ -1037,13 +1707,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.command == "reset-state":
             if not args.yes:
                 parser.error("reset-state requires --yes")
-            backup = store.reset(read_boot_id(), utc_now())
+            backup = store.reset(read_boot_id(), utc_now(), settings.monitor)
             if backup:
                 print(f"state reset; previous snapshot preserved at {backup}")
             else:
                 print("state initialized; no previous snapshot existed")
             return 0
+        if args.command == "check-config":
+            return check_config(settings, build_monitor(settings))
         return build_sentinel(settings).check()
+    except ConfigError as exc:
+        LOGGER.error("configuration error: %s", exc)
+        return 2
     except FutureSchemaError as exc:
         LOGGER.critical("refusing to modify newer state: %s", exc)
         return 3

@@ -2,29 +2,43 @@
 # Keep the bot token out of this file; it belongs in telegram-token.
 TELEGRAM_CHAT_ID=
 
-# The defaults below match the Osaka A1.Flex instance and normally need no change.
-# TOTAL_VCPUS=2
-# SAMPLE_SECONDS=10
-# CPU_THRESHOLD=30
+# What this Sentinel watches: boinc (option 1) or process (option 2).
+# install.sh appends this line; a missing value means boinc.
+# SENTINEL_MONITOR=boinc
+
+# Common settings and their defaults.
 # ALERT_AFTER_FAILURES=2
 # REMINDER_HOURS=12
+# STATE_FILE=/var/lib/sentinel/state.json
+# COMMAND_TIMEOUT=8
 
-# Auto-recovery. On a work shortage Sentinel runs `boinccmd --acct_mgr sync`
-# to make the account manager hand out projects again. That call is destructive:
-# the manager may reply <detach/>, which BOINC acts on immediately and which
-# discards whatever the detached project had in flight. The cooldown is what
-# keeps one detach from cascading into the next check's failure, so lower it
-# with care and set RECOVER_ENABLED=0 to turn the whole thing off.
+# Auto-recovery, shared by both options. RECOVER_ENABLED=0 turns it off.
 # RECOVER_ENABLED=1
 # RECOVER_AFTER_FAILURES=1
 # RECOVER_COOLDOWN_HOURS=6
 # RECOVER_MAX_PER_INCIDENT=2
 # RECOVER_TIMEOUT=45
+#
+# boinc: on a work shortage Sentinel runs `boinccmd --acct_mgr sync` to make the
+# account manager hand out projects again. That call is destructive: the
+# manager may reply <detach/>, which BOINC acts on immediately and which
+# discards whatever the detached project had in flight. The cooldown is what
+# keeps one detach from cascading into the next check's failure, so lower it
+# with care.
+#
+# process: a service target in ActiveState=failed gets `systemctl reset-failed`
+# and `systemctl restart`. The cooldown and the per-incident budget apply per
+# target. The restart needs the sentinel.service.d/restart.conf drop-in; rerun
+# install.sh after changing RECOVER_ENABLED so the drop-in follows it.
 
-# Optional advanced settings and their defaults.
-# STATE_FILE=/var/lib/sentinel/state.json
+# Option 1 (boinc) only. The defaults match the Osaka A1.Flex instance.
+# TOTAL_VCPUS=2
+# SAMPLE_SECONDS=10
+# CPU_THRESHOLD=30
 # BOINC_SERVICE=boinc-client.service
 # BOINCCMD=/usr/bin/boinccmd
 # BOINC_DATA_DIR=/var/lib/boinc-client
 # CGROUP_ROOT=/sys/fs/cgroup
-# COMMAND_TIMEOUT=8
+
+# Option 2 (process) only.
+# TARGETS_FILE=/etc/sentinel/targets

@@ -1,0 +1,17 @@
+# Sentinel option 2 targets, installed as /etc/sentinel/targets with mode 0600.
+# One target per line. Blank lines and lines starting with # are ignored;
+# there are no trailing comments, because # may be part of a regex.
+#
+#   service <unit>     systemd service; ".service" is added when omitted.
+#                      Fails unless ActiveState=active. A failed unit is
+#                      restarted when auto-recovery is on.
+#   process <name>     exact process name, compared with /proc/<pid>/comm or
+#                      the basename of argv[0]. Fails when nothing matches.
+#   cmdline <regex>    regex searched in the full command line, for scripts
+#                      whose process name is only python3 or node.
+#
+# Validate after editing: sudo /usr/local/sbin/sentinel check-config
+#
+# service tailscaled.service
+# process caddy
+# cmdline ^/usr/bin/python3 /opt/bot/main\.py

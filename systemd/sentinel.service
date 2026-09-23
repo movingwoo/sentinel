@@ -1,22 +1,17 @@
 [Unit]
-Description=Check BOINC CPU usage for OCI instance safety
+Description=Sentinel health check
 Documentation=file:///usr/local/share/doc/sentinel/README.md
-After=boinc-client.service network-online.target
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 User=root
 Group=root
-SupplementaryGroups=boinc
 UMask=0077
-WorkingDirectory=-/var/lib/boinc-client
 ExecStart=/usr/local/sbin/sentinel check
 StateDirectory=sentinel
 StateDirectoryMode=0700
-Environment=TOTAL_VCPUS=2
-Environment=SAMPLE_SECONDS=10
-Environment=CPU_THRESHOLD=30
 Environment=ALERT_AFTER_FAILURES=2
 Environment=REMINDER_HOURS=12
 Environment=RECOVER_ENABLED=1

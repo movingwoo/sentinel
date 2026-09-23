@@ -38,3 +38,6 @@ state.json.*
 *~
 .DS_Store
 Thumbs.db
+
+# Local planning notes
+TODO.md
