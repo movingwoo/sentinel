@@ -3,7 +3,7 @@
 TELEGRAM_CHAT_ID=
 
 # What this Sentinel watches: boinc (option 1), process (option 2) or
-# docker (option 3).
+# docker (option 3), or several comma-separated, e.g. boinc,process.
 # install.sh appends this line; a missing value means boinc.
 # SENTINEL_MONITOR=boinc
 

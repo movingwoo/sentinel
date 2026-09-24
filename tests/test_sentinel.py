@@ -1594,6 +1594,141 @@ class DockerClientTests(unittest.TestCase):
         self.assertEqual(seen["path"], "/containers/web/json")
 
 
+class CombinedMonitorTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.path = self.root / "state.json"
+        self.targets = self.root / "targets"
+        self.targets.write_text("service tailscaled\n", encoding="utf-8")
+        self.systemctl = FakeSystemctl({
+            "tailscaled.service": systemctl_show(
+                LoadState="loaded", ActiveState="active", SubState="running", MainPID=42, NRestarts=0
+            )
+        })
+        self.notifier = FakeNotifier(True)
+        self.recovery = FakeRecovery()
+        self.now = at("2026-09-24T02:00:00Z")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def settings(self, **overrides):
+        values = dict(monitor="boinc,process", state_file=self.path, targets_file=self.targets)
+        values.update(overrides)
+        return rg.Settings(**values)
+
+    def sentinel(self, boinc_result):
+        settings = self.settings()
+        monitor = rg.CompositeMonitor(settings.monitor, [
+            rg.BoincMonitor(settings, probe=FakeProbe(boinc_result), recovery=self.recovery),
+            rg.ProcessMonitor(
+                settings, rg.load_targets(self.targets), runner=self.systemctl, self_pid=1
+            ),
+        ])
+        return rg.Sentinel(
+            settings, rg.StateStore(self.path), monitor, self.notifier, "host",
+            boot_id_reader=lambda: "boot",
+        )
+
+    def persisted(self):
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def test_monitor_list_is_canonicalized(self):
+        settings = rg.Settings.from_environment({
+            "SENTINEL_CONFIG": "/nonexistent/sentinel.conf",
+            "SENTINEL_MONITOR": " Process, BOINC,process ",
+        })
+        self.assertEqual(settings.monitor, "boinc,process")
+        self.assertEqual(settings.monitors, ("boinc", "process"))
+        settings.validate()
+        with self.assertRaises(rg.ConfigError):
+            rg.Settings(monitor=rg.normalize_monitor("boinc,glances")).validate()
+
+    def test_boinc_settings_are_still_validated_when_combined(self):
+        with self.assertRaises(rg.ConfigError):
+            rg.Settings(monitor="boinc,process", total_vcpus=0).validate()
+
+    def test_build_monitor_combines_boinc_with_the_targets_file(self):
+        monitor = rg.build_monitor(self.settings())
+        self.assertIsInstance(monitor, rg.CompositeMonitor)
+        self.assertEqual(monitor.name, "boinc,process")
+        self.assertEqual(monitor.target_ids(), [BOINC, "service:tailscaled.service"])
+
+    def test_every_file_monitor_needs_its_own_targets(self):
+        with self.assertRaises(rg.ConfigError) as caught:
+            rg.build_monitor(self.settings(monitor="process,docker"))
+        self.assertIn("no docker targets", str(caught.exception))
+        self.targets.write_text("service tailscaled\ncontainer web\n", encoding="utf-8")
+        monitor = rg.build_monitor(self.settings(monitor="process,docker"))
+        self.assertEqual(monitor.target_ids(), ["service:tailscaled.service", "container:web"])
+
+    def test_state_accepts_only_the_canonical_monitor_list(self):
+        state = rg.default_state("boot", self.now, "boinc,process")
+        rg.validate_state(state)
+        state["monitor"] = "process,boinc"
+        with self.assertRaises(rg.InvalidStateError):
+            rg.validate_state(state)
+
+    def test_adding_process_keeps_the_boinc_history(self):
+        boinc_only, _ = boinc_sentinel(self.path, rg.CheckResult(True, 0, 0.0), recovery=self.recovery)
+        boinc_only.check(self.now - timedelta(hours=1))
+        before = self.persisted()["targets"][BOINC]
+        self.assertEqual(before["last_recovery_at"], rg.utc_text(self.now - timedelta(hours=1)))
+
+        self.sentinel(rg.CheckResult(True, 0, 0.0)).check(self.now)
+        persisted = self.persisted()
+        self.assertEqual(persisted["monitor"], "boinc,process")
+        self.assertEqual(list(persisted["targets"]), [BOINC, "service:tailscaled.service"])
+        boinc = persisted["targets"][BOINC]
+        self.assertEqual(boinc["consecutive_failures"], 2)
+        self.assertEqual(boinc["last_recovery_at"], before["last_recovery_at"])
+        # The BOINC cooldown still holds after the switch.
+        self.assertEqual(self.recovery.calls, 1)
+
+    def test_each_target_recovers_through_its_own_monitor(self):
+        self.systemctl.outputs["tailscaled.service"] = systemctl_show(
+            LoadState="loaded", ActiveState="failed", SubState="failed", MainPID=0, NRestarts=3
+        )
+        self.sentinel(rg.CheckResult(True, 0, 0.0)).check(self.now)
+
+        self.assertEqual(self.recovery.calls, 1)
+        verbs = [call[0][1] for call in self.systemctl.calls]
+        self.assertEqual(verbs, ["show", "reset-failed", "restart"])
+        self.assertEqual(len(self.notifier.messages), 2)
+        self.assertIn("boinccmd --acct_mgr sync", self.notifier.messages[0])
+        self.assertIn("host service:tailscaled.service", self.notifier.messages[1])
+        persisted = self.persisted()
+        self.assertEqual(persisted["current_week"]["checks"], 1)
+        self.assertEqual(persisted["current_week"]["failures"], 2)
+
+    def test_healthy_boinc_and_failing_service_are_independent(self):
+        self.systemctl.outputs["tailscaled.service"] = systemctl_show(
+            LoadState="loaded", ActiveState="inactive", SubState="dead", MainPID=0, NRestarts=0
+        )
+        sentinel = self.sentinel(rg.CheckResult(True, 1, 50.0))
+        sentinel.check(self.now)
+        sentinel.check(self.now + timedelta(minutes=15))
+        targets = self.persisted()["targets"]
+        self.assertEqual(targets[BOINC]["health"], "healthy")
+        self.assertEqual(targets["service:tailscaled.service"]["health"], "unhealthy")
+        self.assertEqual(self.recovery.calls, 0)
+        self.assertEqual(len(self.notifier.messages), 1)
+        self.assertIn("🚨 Sentinel 장애: host service:tailscaled.service", self.notifier.messages[0])
+
+    def test_check_config_lists_every_target(self):
+        settings = self.settings()
+        monitor = rg.CompositeMonitor(settings.monitor, [
+            rg.BoincMonitor(settings, probe=FakeProbe(rg.CheckResult(True, 1, 50.0))),
+            rg.ProcessMonitor(settings, rg.load_targets(self.targets), runner=self.systemctl),
+        ])
+        lines = []
+        rg.check_config(settings, monitor, out=lines.append)
+        self.assertEqual(lines[0], "monitor=boinc,process targets=2")
+        self.assertTrue(lines[1].startswith("ok   boinc "))
+        self.assertTrue(lines[2].startswith("ok   service:tailscaled.service "))
+
+
 class UnitTests(unittest.TestCase):
     def read(self, relative):
         return (ROOT / "systemd" / relative).read_text(encoding="utf-8")

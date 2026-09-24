@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: install.sh [--monitor boinc|process|docker]" >&2
+    echo "usage: install.sh [--monitor boinc|process|docker[,...]]" >&2
     exit 2
 }
 
@@ -42,7 +42,34 @@ conf_value() {
         | tail -n 1 | tr -d "\"' \t\r" | tr '[:upper:]' '[:lower:]'
 }
 
+# Canonicalize a comma-separated monitor list the way sentinel does: known
+# names deduplicated in boinc,process,docker order. Unknown names fail.
+normalize_monitor() {
+    local part result="" name
+    local -a parts
+    local -A seen=()
+    IFS=, read -r -a parts <<<"$1"
+    for part in "${parts[@]}"; do
+        [[ -n ${part} ]] || continue
+        case "${part}" in
+            boinc|process|docker) seen[${part}]=1 ;;
+            *) echo "unknown monitor: ${part}" >&2; return 1 ;;
+        esac
+    done
+    for name in boinc process docker; do
+        [[ -n ${seen[${name}]:-} ]] && result+=${result:+,}${name}
+    done
+    printf '%s\n' "${result}"
+}
+
+has_monitor() {
+    [[ ,${monitor}, == *,$1,* ]]
+}
+
 configured=$(conf_value SENTINEL_MONITOR)
+if [[ -n ${configured} ]]; then
+    configured=$(normalize_monitor "${configured}") || usage
+fi
 if [[ -z ${monitor} ]]; then
     if [[ -n ${configured} ]]; then
         monitor=${configured}
@@ -54,28 +81,28 @@ if [[ -z ${monitor} ]]; then
         echo "  1) BOINC"
         echo "  2) services/processes"
         echo "  3) Docker containers"
+        echo "  4) BOINC and services/processes"
         read -r -p "choice [1]: " choice
         case "${choice:-1}" in
             1) monitor=boinc ;;
             2) monitor=process ;;
             3) monitor=docker ;;
+            4) monitor=boinc,process ;;
             *) echo "invalid choice: ${choice}" >&2; exit 2 ;;
         esac
     else
         monitor=boinc
     fi
 fi
-case "${monitor}" in
-    boinc|process|docker) ;;
-    *) echo "unknown monitor: ${monitor}" >&2; usage ;;
-esac
+monitor=$(normalize_monitor "$(tr -d ' \t' <<<"${monitor}" | tr '[:upper:]' '[:lower:]')") || usage
+[[ -n ${monitor} ]] || usage
 if [[ -n ${configured} && ${configured} != "${monitor}" ]]; then
     echo "${conf} sets SENTINEL_MONITOR=${configured}; refusing to switch to ${monitor}." >&2
     echo "Change SENTINEL_MONITOR there first if the switch is intended." >&2
     exit 1
 fi
 
-if [[ ${monitor} == boinc ]]; then
+if has_monitor boinc; then
     # The BOINC drop-in adds SupplementaryGroups=boinc, which fails the unit
     # outright (216/GROUP) when the group does not exist.
     if ! getent group boinc >/dev/null; then
@@ -86,7 +113,7 @@ if [[ ${monitor} == boinc ]]; then
     systemctl cat boinc-client.service >/dev/null 2>&1 \
         || echo "warning: boinc-client.service not found" >&2
 fi
-if [[ ${monitor} == docker && ! -S /var/run/docker.sock ]]; then
+if has_monitor docker && [[ ! -S /var/run/docker.sock ]]; then
     echo "warning: /var/run/docker.sock not found; is Docker installed and running?" >&2
 fi
 
@@ -117,18 +144,23 @@ chmod 0600 "${conf}" /etc/sentinel/telegram-token
 rm -f "${service_dropins}/boinc.conf" "${service_dropins}/restart.conf" \
     "${service_dropins}/docker.conf" "${timer_dropins}/interval.conf" \
     "${timer_dropins}/process.conf"
-if [[ ${monitor} == boinc ]]; then
+if has_monitor boinc; then
     install -D -m 0644 "${source_dir}/systemd/sentinel.service.d/boinc.conf" \
         "${service_dropins}/boinc.conf"
-else
-    install -D -m 0644 "${source_dir}/systemd/sentinel.timer.d/interval.conf" \
-        "${timer_dropins}/interval.conf"
-    if [[ ${monitor} == docker ]]; then
+fi
+if has_monitor process || has_monitor docker; then
+    # The 5 minute timer suits services and containers, but BOINC keeps its
+    # 15 minutes when combined: a denser schedule is likelier to catch the
+    # brief gap between two tasks as starvation and run the destructive sync.
+    if ! has_monitor boinc; then
+        install -D -m 0644 "${source_dir}/systemd/sentinel.timer.d/interval.conf" \
+            "${timer_dropins}/interval.conf"
+    fi
+    if has_monitor docker; then
         install -D -m 0644 "${source_dir}/systemd/sentinel.service.d/docker.conf" \
             "${service_dropins}/docker.conf"
-        example=targets.docker.example
-        prompt="container <name>"
-    else
+    fi
+    if has_monitor process; then
         # systemctl restart needs CAP_SYS_ADMIN; grant it only while auto-recovery is on.
         case "$(conf_value RECOVER_ENABLED)" in
             0|false|no|off) ;;
@@ -139,6 +171,12 @@ else
         esac
         example=targets.example
         prompt="service <unit> | process <name> | cmdline <regex>"
+        if has_monitor docker; then
+            prompt="${prompt} | container <name>"
+        fi
+    else
+        example=targets.docker.example
+        prompt="container <name>"
     fi
 
     if [[ ! -e ${targets} ]]; then

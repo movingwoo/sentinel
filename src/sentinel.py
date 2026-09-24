@@ -153,6 +153,37 @@ def read_config_file(path: Path) -> dict[str, str]:
     return values
 
 
+def normalize_monitor(value: str) -> str:
+    """Canonicalize SENTINEL_MONITOR, which may combine monitors: "process, boinc".
+
+    Known monitors are deduplicated and put in MONITORS order so the stored
+    state and install.sh compare equal however the list was written. Unknown
+    names are kept for validation to reject.
+    """
+    parts: list[str] = []
+    for part in value.split(","):
+        part = part.strip().lower()
+        if part and part not in parts:
+            parts.append(part)
+    if not parts:
+        return "boinc"
+    known = sorted((part for part in parts if part in MONITORS), key=MONITORS.index)
+    return ",".join(known + [part for part in parts if part not in MONITORS])
+
+
+def monitor_parts(monitor: str) -> tuple[str, ...]:
+    return tuple(monitor.split(","))
+
+
+def _valid_monitor(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and all(part in MONITORS for part in monitor_parts(value))
+        and normalize_monitor(value) == value
+    )
+
+
 def read_boot_id(path: Path = Path("/proc/sys/kernel/random/boot_id")) -> str:
     return path.read_text(encoding="ascii").strip()
 
@@ -356,7 +387,7 @@ def validate_state(state: Any) -> dict[str, Any]:
         raise InvalidStateError(f"state is missing keys: {', '.join(sorted(missing))}")
     if state["schema_version"] != SCHEMA_VERSION:
         raise InvalidStateError("state has the wrong schema after migration")
-    if state["monitor"] not in MONITORS:
+    if not _valid_monitor(state["monitor"]):
         raise InvalidStateError("monitor is invalid")
     if not isinstance(state["boot_id"], str):
         raise InvalidStateError("boot_id is invalid")
@@ -737,7 +768,7 @@ class Settings:
         )
         try:
             return cls(
-                monitor=environ.get("SENTINEL_MONITOR", "boinc").strip().lower() or "boinc",
+                monitor=normalize_monitor(environ.get("SENTINEL_MONITOR", "boinc")),
                 state_file=Path(environ.get("STATE_FILE", "/var/lib/sentinel/state.json")),
                 service_name=environ.get("BOINC_SERVICE", "boinc-client.service"),
                 boinccmd=environ.get("BOINCCMD", "/usr/bin/boinccmd"),
@@ -762,9 +793,16 @@ class Settings:
         except ValueError as exc:
             raise ConfigError(f"invalid setting: {exc}") from exc
 
+    @property
+    def monitors(self) -> tuple[str, ...]:
+        return monitor_parts(self.monitor)
+
     def validate(self) -> None:
-        if self.monitor not in MONITORS:
-            raise ConfigError(f"SENTINEL_MONITOR must be one of: {', '.join(MONITORS)}")
+        if not all(part in MONITORS for part in self.monitors):
+            raise ConfigError(
+                f"SENTINEL_MONITOR must be one or more of: {', '.join(MONITORS)} "
+                f"(comma-separated)"
+            )
         if self.alert_after_failures < 1:
             raise ConfigError("ALERT_AFTER_FAILURES must be at least 1")
         if not math.isfinite(self.reminder_hours) or self.reminder_hours <= 0:
@@ -779,7 +817,7 @@ class Settings:
             raise ConfigError("RECOVER_COOLDOWN_HOURS must be positive")
         if not math.isfinite(self.recover_timeout) or self.recover_timeout <= 0:
             raise ConfigError("RECOVER_TIMEOUT must be positive")
-        if self.monitor != "boinc":
+        if "boinc" not in self.monitors:
             return
         if not math.isfinite(self.sample_seconds) or self.sample_seconds <= 0:
             raise ConfigError("SAMPLE_SECONDS must be positive")
@@ -1922,13 +1960,54 @@ class Sentinel:
         return 0
 
 
+class CompositeMonitor:
+    """Several monitors in one run, e.g. SENTINEL_MONITOR=boinc,process.
+
+    Target IDs never collide across monitors (boinc versus kind:value), so each
+    target keeps its own incident and recovery goes to the monitor that owns it.
+    """
+
+    def __init__(self, name: str, monitors: list[Any]):
+        self.name = name
+        self.monitors = monitors
+        self.owners: dict[str, Any] = {}
+        for monitor in monitors:
+            for target_id in monitor.target_ids():
+                self.owners[target_id] = monitor
+
+    def target_ids(self) -> list[str]:
+        return [target_id for monitor in self.monitors for target_id in monitor.target_ids()]
+
+    def check(self) -> list[TargetResult]:
+        return [result for monitor in self.monitors for result in monitor.check()]
+
+    def recover(self, target_id: str) -> tuple[bool, str]:
+        return self.owners[target_id].recover(target_id)
+
+
 def build_monitor(settings: Settings) -> Any:
-    if settings.monitor == "boinc":
-        return BoincMonitor(settings)
-    targets = load_targets(settings.targets_file, MONITOR_KINDS[settings.monitor])
-    if settings.monitor == "docker":
-        return DockerMonitor(settings, targets)
-    return ProcessMonitor(settings, targets)
+    parts = settings.monitors
+    monitors: list[Any] = []
+    if "boinc" in parts:
+        monitors.append(BoincMonitor(settings))
+    file_monitors = [part for part in parts if part in MONITOR_KINDS]
+    if file_monitors:
+        # One targets file serves every file-based monitor; each takes its own kinds.
+        kinds = tuple(kind for part in file_monitors for kind in MONITOR_KINDS[part])
+        targets = load_targets(settings.targets_file, kinds)
+        for part in file_monitors:
+            own = [target for target in targets if target.kind in MONITOR_KINDS[part]]
+            if not own:
+                raise ConfigError(
+                    f"targets file has no {part} targets "
+                    f"({', '.join(MONITOR_KINDS[part])}) for SENTINEL_MONITOR={settings.monitor}"
+                )
+            monitors.append(
+                DockerMonitor(settings, own) if part == "docker" else ProcessMonitor(settings, own)
+            )
+    if len(monitors) == 1:
+        return monitors[0]
+    return CompositeMonitor(settings.monitor, monitors)
 
 
 def build_sentinel(settings: Settings) -> Sentinel:

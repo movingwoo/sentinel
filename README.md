@@ -2,13 +2,16 @@
 
 이게 뭐임?  
 서버를 지켜보다 문제가 생기면 텔레그램으로 경고하는 감시자.  
-서버마다 셋 중 하나를 골라 설치함.
+서버마다 하나를 고르거나 `boinc,process`처럼 여러 개를 함께 설치함.
 
 1. `boinc`: BOINC 서비스와 CPU 사용량 감시 (기존 동작)
 2. `process`: 등록한 systemd 서비스나 프로세스의 생존과 재시작 감시
 3. `docker`: 등록한 Docker 컨테이너의 생존, healthcheck, 재시작 감시
 
 `/etc/sentinel/sentinel.conf`의 `SENTINEL_MONITOR`로 정함. 값이 없으면 `boinc`.  
+쉼표로 묶으면 한 번의 실행에서 모두 점검함 (예: `SENTINEL_MONITOR=boinc,process`로 BOINC와 tailscaled를 같이 감시).
+대상마다 장애·자동복구·쿨다운이 따로 관리되고, 자동복구는 그 대상을 맡은 옵션의 방식으로 실행됨.
+`process`와 `docker`를 함께 쓰면 targets 파일 하나에 두 종류를 같이 적음.
 셸에서 `sudo /usr/local/sbin/sentinel ...`로 직접 실행해도 이 파일을 읽으므로 timer와 같은 옵션으로 동작함.
 환경변수가 있으면 환경변수가 이김 (systemd `EnvironmentFile`과 같은 규칙).
 
@@ -113,10 +116,11 @@ Ubuntu 24.04의 root 셸에서 저장소 기준
 `telegram-token`, `.env` 파일은 Git에서 제외됨.
 
 ```sh
-sudo ./install.sh                     # 새 설치면 1) BOINC 2) 서비스/프로세스 메뉴
+sudo ./install.sh                     # 새 설치면 선택 메뉴 (4번이 BOINC+서비스/프로세스)
 sudo ./install.sh --monitor boinc
 sudo ./install.sh --monitor process
 sudo ./install.sh --monitor docker
+sudo ./install.sh --monitor boinc,process   # 조합
 ```
 
 인스톨러는 기존 상태와 로컬 설정을 덮어쓰지 않음.  
@@ -125,6 +129,7 @@ BOINC를 재시작하지 않고 `systemctl daemon-reload`만 수행한 뒤 timer
 - 옵션은 `--monitor`, 기존 `sentinel.conf`의 `SENTINEL_MONITOR` 순으로 정함. 기존 conf에 값이 없으면 업그레이드로 보고 `boinc`
 - 기존 conf와 다른 옵션을 주면 중단함. 바꾸려면 conf의 `SENTINEL_MONITOR`를 먼저 고칠 것
 - `boinc`: `boinc` 그룹이 없으면 중단. BOINC 전용 설정(`SupplementaryGroups=boinc` 등)은 `sentinel.service.d/boinc.conf` drop-in으로만 설치되므로 BOINC 없는 서버에서도 기본 유닛이 뜸
+- 조합에 `boinc`가 있으면 timer는 15분 그대로 둠. 5분 주기는 task 사이의 짧은 공백을 일감 고갈로 잡아 파괴적인 sync를 부를 가능성을 높이기 때문
 - `process`, `docker`: targets 파일이 없으면 대상을 입력받아 만들고 `check-config`가 실패하면 timer를 켜지 않고 중단
 
 기존 Telegram bot의 chat ID를 root 전용 설정에 기록해야 함.
