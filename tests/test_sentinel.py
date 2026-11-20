@@ -27,6 +27,15 @@ def boinc_state(boot_id, now):
     return state
 
 
+def schema3_state(now):
+    """What the release before the resource monitor wrote: BOINC plus a service."""
+    state = boinc_state("boot", now)
+    rg.sync_targets(state, "boinc,process", [BOINC, "service:tailscaled.service"])
+    state["schema_version"] = 3
+    del state["resource"]
+    return state
+
+
 def apply_boinc(state, check_result, now, threshold=30, alert_after=2):
     rg.apply_result(state, rg.boinc_target_result(check_result, threshold), now, alert_after)
 
@@ -203,7 +212,7 @@ class MigrationTests(unittest.TestCase):
     def test_schema_two_moves_the_boinc_incident_under_targets(self):
         state = rg.migrate_state(schema2_state(), "boot", at("2026-09-02T09:00:00Z"))
 
-        self.assertEqual(state["schema_version"], 3)
+        self.assertEqual(state["schema_version"], rg.SCHEMA_VERSION)
         self.assertEqual(state["monitor"], "boinc")
         target = state["targets"][BOINC]
         self.assertEqual(target["consecutive_failures"], 99)
@@ -255,7 +264,7 @@ class MigrationTests(unittest.TestCase):
             path.write_text(json.dumps(schema2_state()), encoding="utf-8")
             rg.StateStore(path).load("boot", at("2026-09-02T09:00:00Z"))
             persisted = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(persisted["schema_version"], 3)
+            self.assertEqual(persisted["schema_version"], rg.SCHEMA_VERSION)
             self.assertIn(BOINC, persisted["targets"])
 
 
@@ -733,6 +742,81 @@ class SettingsTests(unittest.TestCase):
             settings = rg.Settings.from_environment()
         self.assertEqual(settings.monitor, "process")
         self.assertEqual(settings.targets_file, Path("/tmp/targets"))
+
+    def test_every_resource_limit_comes_from_the_environment(self):
+        with self.env(
+            SENTINEL_MONITOR="resource",
+            RESOURCE_CPU_MAX="75.5",
+            RESOURCE_MEMORY_MAX="80",
+            RESOURCE_DISK_MAX="85",
+            RESOURCE_DISK_PATHS=" /, /var/lib/ ,",
+            RESOURCE_NET_INTERFACE=" eth1 ",
+            RESOURCE_NET_TX_MBPS="12.5",
+            RESOURCE_NET_MONTH_TX_GB="9000",
+        ):
+            settings = rg.Settings.from_environment()
+        settings.validate()
+        self.assertEqual(
+            (
+                settings.resource_cpu_max,
+                settings.resource_memory_max,
+                settings.resource_disk_max,
+                settings.resource_disk_paths,
+                settings.resource_net_interface,
+                settings.resource_net_tx_mbps,
+                settings.resource_net_month_tx_gb,
+            ),
+            (75.5, 80.0, 85.0, ("/", "/var/lib"), "eth1", 12.5, 9000.0),
+        )
+
+    def test_resource_defaults_follow_the_oracle_free_allowance(self):
+        with self.env(SENTINEL_MONITOR="resource"):
+            settings = rg.Settings.from_environment()
+        settings.validate()
+        # 30 Mbit/s for a whole month is about the 10 TB that is free.
+        month_seconds = 30.4 * 86400
+        self.assertAlmostEqual(
+            settings.resource_net_tx_mbps * 1e6 / 8 * month_seconds / 1e12, 10, delta=0.2
+        )
+        self.assertEqual(settings.resource_net_month_tx_gb, 8000.0)
+        self.assertEqual(settings.resource_disk_paths, ("/",))
+
+    def test_resource_limits_are_checked_only_for_the_resource_monitor(self):
+        rg.Settings(monitor="process", resource_cpu_max=500).validate()
+        for overrides in (
+            {"resource_cpu_max": 101},
+            {"resource_memory_max": -1},
+            {"resource_disk_max": float("nan")},
+            {"resource_net_tx_mbps": -0.1},
+            {"resource_net_month_tx_gb": float("inf")},
+            {"resource_disk_paths": ()},
+            {"resource_disk_paths": ("var",)},
+            {"resource_disk_paths": ("/", "/")},
+        ):
+            with self.subTest(overrides), self.assertRaises(rg.ConfigError):
+                rg.Settings(monitor="resource", **overrides).validate()
+        # Paths are not looked at while the disk check is off.
+        rg.Settings(monitor="resource", resource_disk_max=0, resource_disk_paths=()).validate()
+
+    def test_disk_paths_the_unit_cannot_see_are_rejected(self):
+        for hidden in ("/home", "/home/ubuntu/data", "/root", "/run/user/1000"):
+            with self.subTest(hidden), self.assertRaises(rg.ConfigError) as caught:
+                rg.Settings(monitor="resource", resource_disk_paths=(hidden,)).validate()
+            self.assertIn("ProtectHome=yes", str(caught.exception))
+        rg.Settings(monitor="resource", resource_disk_paths=("/homestead", "/run")).validate()
+
+    def test_resource_monitor_with_every_limit_off_is_rejected(self):
+        settings = rg.Settings(
+            monitor="process,resource",
+            resource_cpu_max=0,
+            resource_memory_max=0,
+            resource_disk_max=0,
+            resource_net_tx_mbps=0,
+            resource_net_month_tx_gb=0,
+        )
+        with self.assertRaises(rg.ConfigError) as caught:
+            settings.validate()
+        self.assertIn("every RESOURCE_* limit is 0", str(caught.exception))
 
 
 class TargetParserTests(unittest.TestCase):
@@ -1281,6 +1365,23 @@ class MainTests(unittest.TestCase):
                     self.assertEqual(rg.main(["check-config"]), 2)
             self.assertIn("targets line 1: unknown kind", logs.output[0])
 
+    def test_bad_resource_limit_exits_with_config_error(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            env = {
+                "SENTINEL_MONITOR": "resource",
+                "RESOURCE_CPU_MAX": "200",
+                "STATE_FILE": str(Path(directory) / "state.json"),
+                "SENTINEL_CONFIG": str(Path(directory) / "missing.conf"),
+            }
+            with mock.patch.dict("os.environ", env, clear=True), mock.patch.object(
+                rg, "configure_logging"
+            ):
+                with self.assertLogs("sentinel", "ERROR") as logs:
+                    self.assertEqual(rg.main(["check-config"]), 2)
+            self.assertIn("RESOURCE_CPU_MAX must be between 0 and 100", logs.output[0])
+
 
 class ConfigFileTests(unittest.TestCase):
     def test_shell_invocation_reads_sentinel_conf(self):
@@ -1371,7 +1472,7 @@ class BootAlertTests(unittest.TestCase):
             self.assertTrue(notifier.messages[0].startswith("🔄 Sentinel 재부팅 감지: host"))
 
     def test_schema_three_state_without_the_field_still_loads(self):
-        state = boinc_state("boot", at("2026-09-23T00:00:00Z"))
+        state = schema3_state(at("2026-09-23T00:00:00Z"))
         del state["pending_boot_alert"]
         migrated = rg.migrate_state(state, "boot", at("2026-09-23T00:00:00Z"))
         self.assertIsNone(migrated["pending_boot_alert"])
@@ -1729,6 +1830,761 @@ class CombinedMonitorTests(unittest.TestCase):
         self.assertTrue(lines[2].startswith("ok   service:tailscaled.service "))
 
 
+# Captured on the Osaka A1 host while one BOINC task filled a core at nice 19.
+STAT_REAL = (
+    "cpu  183239 35815450 100098 35599646 4268 0 27207 121589 0 0\n"
+    "cpu0 91620 17907725 50049 17799823 2134 0 13604 60795 0 0\n"
+)
+STAT_REAL_5S_LATER = "cpu  183274 35815942 100107 35600098 4268 0 27214 121593 0 0\n"
+NET_DEV = (
+    "Inter-|   Receive                                                |  Transmit\n"
+    " face |bytes    packets errs drop fifo frame compressed multicast"
+    "|bytes    packets errs drop fifo colls carrier compressed\n"
+    "    lo: 17798258   56265    0    0    0     0          0         0"
+    " 17798258   56265    0    0    0     0       0          0\n"
+    "enp0s6: 1300842467 1105066    0    0    0     0          0         0"
+    " {sent}  726578    0    0    0     0       0          0\n"
+    "tailscale0: 654163702  470798    0    0    0     0          0         0"
+    " 83190485  263378    0    0    0     0       0          0\n"
+)
+ROUTE_HEADER = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+NET_ROUTE = (
+    ROUTE_HEADER
+    + "enp0s6\t00000000\t0100000A\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
+    + "enp0s6\t0000000A\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n"
+)
+RESOURCE_IDS = [
+    "resource:cpu",
+    "resource:memory",
+    "resource:disk:/",
+    "resource:tx-rate",
+    "resource:tx-month",
+]
+
+
+class FakeHost:
+    """The /proc files the resource monitor reads, with a statvfs() and a clock."""
+
+    def __init__(self, root):
+        self.root = Path(root)
+        (self.root / "net").mkdir(parents=True)
+        (self.root / "net" / "route").write_text(NET_ROUTE, encoding="ascii")
+        self.cpu(busy=0, nice=0, idle=1000)
+        self.memory(available_kb=7_500_000)
+        self.tx(0)
+        # Blocks of 1 GiB: total, free, free for an unprivileged writer.
+        self.disks = {"/": (1000, 600, 550)}
+        self.sleeps = []
+        self.during_sleep = lambda: None
+
+    def cpu(self, busy, nice, idle):
+        (self.root / "stat").write_text(f"cpu  {busy} {nice} 0 {idle} 0 0 0 0 0 0\n", encoding="ascii")
+
+    def memory(self, available_kb, total_kb=10_000_000):
+        (self.root / "meminfo").write_text(
+            f"MemTotal:       {total_kb} kB\nMemFree:          1024 kB\n"
+            f"MemAvailable:   {available_kb} kB\n",
+            encoding="ascii",
+        )
+
+    def tx(self, sent):
+        (self.root / "net" / "dev").write_text(NET_DEV.format(sent=sent), encoding="ascii")
+
+    def statvfs(self, path):
+        from types import SimpleNamespace
+
+        if path not in self.disks:
+            raise FileNotFoundError(path)
+        blocks, free, available = self.disks[path]
+        return SimpleNamespace(f_blocks=blocks, f_bfree=free, f_bavail=available, f_frsize=1024**3)
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.during_sleep()
+
+    def monotonic(self):
+        return sum(self.sleeps)
+
+    def monitor(self, settings):
+        return rg.ResourceMonitor(
+            settings, statvfs=self.statvfs, sleeper=self.sleep, monotonic=self.monotonic
+        )
+
+
+def stored_counters(busy=0, total=0, sent=0, month_bytes=0, sampled_at="2026-11-20T00:00:00Z"):
+    return {
+        "cpu": {"sampled_at": sampled_at, "busy": busy, "total": total},
+        "tx": {"sampled_at": sampled_at, "interface": "enp0s6", "bytes": sent},
+        "tx_month": {"month": "2026-11", "bytes": month_bytes},
+    }
+
+
+class ResourceReadTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        (self.root / "net").mkdir()
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_cpu_usage_leaves_out_nice_idle_iowait_and_steal(self):
+        (self.root / "stat").write_text(STAT_REAL, encoding="ascii")
+        before = rg.read_cpu_times(self.root)
+        self.assertEqual(before, (183239 + 100098 + 27207, 71851497))
+        (self.root / "stat").write_text(STAT_REAL_5S_LATER, encoding="ascii")
+        after = rg.read_cpu_times(self.root)
+        # BOINC took about half of the two vCPUs in those five seconds.
+        self.assertAlmostEqual(rg.cpu_percent(before, after), 51 / 999 * 100)
+        self.assertIsNone(rg.cpu_percent(after, after))
+        self.assertIsNone(rg.cpu_percent(after, before))
+
+    def test_truncated_stat_is_an_error(self):
+        (self.root / "stat").write_text("cpu  1 2 3\n", encoding="ascii")
+        with self.assertRaises(ValueError):
+            rg.read_cpu_times(self.root)
+
+    def test_transmit_counter_is_the_ninth_field_of_the_interface(self):
+        (self.root / "net" / "dev").write_text(NET_DEV.format(sent=500006056), encoding="ascii")
+        self.assertEqual(rg.read_tx_bytes(self.root, "enp0s6"), 500006056)
+        self.assertEqual(rg.read_tx_bytes(self.root, "tailscale0"), 83190485)
+        self.assertEqual(rg.read_tx_bytes(self.root, "lo"), 17798258)
+        self.assertIsNone(rg.read_tx_bytes(self.root, "eth9"))
+
+    def test_default_interface_is_the_lowest_metric_default_route(self):
+        route = self.root / "net" / "route"
+        route.write_text(NET_ROUTE, encoding="ascii")
+        self.assertEqual(rg.default_interface(self.root), "enp0s6")
+        route.write_text(
+            ROUTE_HEADER
+            + "wlan0\t00000000\t0100000A\t0003\t0\t0\t600\t00000000\t0\t0\t0\n"
+            + "eth0\t00000000\t0100000A\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
+            + "down0\t00000000\t0100000A\t0002\t0\t0\t1\t00000000\t0\t0\t0\n",
+            encoding="ascii",
+        )
+        self.assertEqual(rg.default_interface(self.root), "eth0")
+        route.write_text(ROUTE_HEADER, encoding="ascii")
+        self.assertIsNone(rg.default_interface(self.root))
+
+
+class ResourceCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.host = FakeHost(Path(self.directory.name) / "proc")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def monitor(self, **overrides):
+        settings = rg.Settings(monitor="resource", proc_root=self.host.root, **overrides)
+        settings.validate()
+        return self.host.monitor(settings)
+
+    def check(self, counters, when="2026-11-20T00:15:00Z", **overrides):
+        monitor = self.monitor(**overrides)
+        monitor.resume(counters, at(when))
+        return {result.target_id: result for result in monitor.check()}
+
+    def test_first_run_samples_inside_the_run_and_leaves_counters_for_the_next(self):
+        counters = rg.default_resource_state()
+        self.host.tx(1_000_000)
+
+        def five_busy_seconds():
+            self.host.cpu(busy=250, nice=500, idle=1250)
+            self.host.tx(1_000_000 + 12_500_000)
+
+        self.host.during_sleep = five_busy_seconds
+        results = self.check(counters, "2026-11-20T00:00:00Z")
+
+        self.assertEqual(list(results), RESOURCE_IDS)
+        self.assertEqual(self.host.sleeps, [rg.RESOURCE_SAMPLE_SECONDS])
+        self.assertEqual(
+            results["resource:cpu"].details, {"percent": 25.0, "limit": 90.0, "window_seconds": 5}
+        )
+        self.assertEqual(
+            results["resource:tx-rate"].details,
+            {"mbps": 20.0, "limit": 30.0, "window_seconds": 5, "interface": "enp0s6"},
+        )
+        # Nothing is known about the traffic before the first run.
+        self.assertEqual(
+            results["resource:tx-month"].details,
+            {"gb": 0.0, "limit": 8000.0, "month": "2026-11", "interface": "enp0s6"},
+        )
+        self.assertTrue(all(result.healthy for result in results.values()))
+        # The stored readings are the ones from before the wait.
+        self.assertEqual(counters, stored_counters(busy=0, total=1000, sent=1_000_000))
+
+    def test_later_runs_average_since_the_stored_counters_without_waiting(self):
+        counters = stored_counters(busy=0, total=1000, sent=1_000_000, month_bytes=5_000_000_000)
+        self.host.cpu(busy=9_000, nice=80_000, idle=2_000)
+        self.host.tx(1_000_000 + 2_250_000_000)
+        results = self.check(counters)
+
+        self.assertEqual(self.host.sleeps, [])
+        self.assertEqual(
+            results["resource:cpu"].details, {"percent": 10.0, "limit": 90.0, "window_seconds": 900}
+        )
+        self.assertEqual(
+            results["resource:tx-rate"].details,
+            {"mbps": 20.0, "limit": 30.0, "window_seconds": 900, "interface": "enp0s6"},
+        )
+        self.assertEqual(results["resource:tx-month"].details["gb"], 7.25)
+        self.assertEqual(counters, {
+            "cpu": {"sampled_at": "2026-11-20T00:15:00Z", "busy": 9_000, "total": 91_000},
+            "tx": {
+                "sampled_at": "2026-11-20T00:15:00Z",
+                "interface": "enp0s6",
+                "bytes": 2_251_000_000,
+            },
+            "tx_month": {"month": "2026-11", "bytes": 7_250_000_000},
+        })
+
+    def test_boinc_at_nice_is_not_usage_but_everything_else_is(self):
+        self.host.cpu(busy=5_000, nice=170_000, idle=5_000)
+        results = self.check(stored_counters())
+        self.assertEqual(results["resource:cpu"].details["percent"], 2.8)
+        self.assertEqual(results["resource:cpu"].reasons, [])
+
+        self.host.cpu(busy=171_000, nice=9_000, idle=0)
+        results = self.check(stored_counters())
+        self.assertEqual(results["resource:cpu"].reasons, ["CPU 95.0% > 90%"])
+        self.assertEqual(results["resource:cpu"].recovery_hint, "resource targets only alert")
+        self.assertEqual(self.check(stored_counters(), resource_cpu_max=96)["resource:cpu"].reasons, [])
+
+    def test_only_a_reading_over_the_limit_fails(self):
+        self.host.memory(available_kb=1_000_000)
+        self.assertEqual(self.check(stored_counters())["resource:memory"].reasons, [])
+
+        self.host.memory(available_kb=990_000)
+        memory = self.check(stored_counters())["resource:memory"]
+        self.assertEqual(memory.reasons, ["memory 90.1% > 90%"])
+        self.assertEqual(
+            memory.details,
+            {"percent": 90.1, "limit": 90.0, "available_mib": 966, "total_mib": 9765},
+        )
+        memory = self.check(stored_counters(), resource_memory_max=89.5)["resource:memory"]
+        self.assertEqual(memory.reasons, ["memory 90.1% > 89.5%"])
+
+    def test_disk_is_the_df_figure_and_each_path_is_its_own_target(self):
+        self.host.disks = {"/": (1000, 600, 550), "/data": (200, 12, 2)}
+        results = self.check(stored_counters(), resource_disk_paths=("/", "/data", "/gone"))
+        self.assertEqual(
+            results["resource:disk:/"].details,
+            {"percent": 42.1, "limit": 90.0, "free_gib": 550.0, "total_gib": 1000.0},
+        )
+        self.assertEqual(results["resource:disk:/"].reasons, [])
+        self.assertEqual(results["resource:disk:/data"].reasons, ["disk 98.9% > 90%"])
+        self.assertEqual(results["resource:disk:/gone"].reasons, ["disk query FileNotFoundError"])
+        self.assertFalse(results["resource:disk:/gone"].probe_ok)
+
+    def test_traffic_over_either_limit_fails_its_own_target(self):
+        counters = stored_counters(sent=0, month_bytes=7_990_000_000_000)
+        self.host.tx(11_250_000_000)
+        results = self.check(counters)
+        self.assertEqual(results["resource:tx-rate"].reasons, ["TX 100.00Mbps > 30Mbps"])
+        self.assertEqual(results["resource:tx-month"].reasons, ["month TX 8001.2GB > 8000GB"])
+
+        counters = stored_counters(sent=0, month_bytes=7_990_000_000_000)
+        results = self.check(counters, resource_net_tx_mbps=200, resource_net_month_tx_gb=9500)
+        self.assertEqual(results["resource:tx-rate"].reasons, [])
+        self.assertEqual(results["resource:tx-month"].reasons, [])
+
+    def test_counters_too_old_too_new_or_from_the_future_give_way_to_a_sample(self):
+        def advance():
+            self.host.cpu(busy=40, nice=0, idle=1060)
+            self.host.tx(2_500_000)
+
+        self.host.during_sleep = advance
+        for when in ("2026-11-20T01:00:01Z", "2026-11-20T00:00:03Z", "2026-11-19T23:59:00Z"):
+            with self.subTest(when):
+                self.host.sleeps.clear()
+                self.host.cpu(busy=0, nice=0, idle=1000)
+                self.host.tx(0)
+                results = self.check(stored_counters(), when)
+                self.assertEqual(self.host.sleeps, [5.0])
+                self.assertEqual(results["resource:cpu"].details["percent"], 40.0)
+                self.assertEqual(results["resource:tx-rate"].details["mbps"], 4.0)
+
+        self.host.sleeps.clear()
+        self.check(stored_counters(), "2026-11-20T01:00:00Z")
+        self.assertEqual(self.host.sleeps, [])
+
+    def test_month_total_starts_over_with_the_calendar_month(self):
+        counters = stored_counters(
+            sent=1_000, month_bytes=9_000_000_000, sampled_at="2026-11-30T23:50:00Z"
+        )
+        self.host.tx(1_000 + 3_000_000_000)
+        month = self.check(counters, "2026-12-01T00:05:00Z")["resource:tx-month"]
+        self.assertEqual(month.details["gb"], 3.0)
+        self.assertEqual(month.details["month"], "2026-12")
+        self.assertEqual(counters["tx_month"], {"month": "2026-12", "bytes": 3_000_000_000})
+
+    def test_after_a_reboot_everything_sent_since_boot_joins_the_month(self):
+        state = rg.default_state("boot-a", at("2026-11-20T00:00:00Z"), "resource")
+        state["resource"] = stored_counters(
+            busy=500, total=1000, sent=900_000_000, month_bytes=2_000_000_000
+        )
+        rg.handle_boot_change(state, "boot-b", at("2026-11-20T00:15:00Z"))
+        self.assertEqual(state["resource"], {
+            "cpu": None,
+            "tx": {"sampled_at": None, "interface": "enp0s6", "bytes": 0},
+            "tx_month": {"month": "2026-11", "bytes": 2_000_000_000},
+        })
+        rg.validate_state(state)
+
+        self.host.tx(400_000_000)
+
+        def advance():
+            self.host.cpu(busy=10, nice=0, idle=1090)
+            self.host.tx(400_000_000 + 6_250_000)
+
+        self.host.during_sleep = advance
+        results = self.check(state["resource"])
+        self.assertEqual(self.host.sleeps, [5.0])
+        self.assertEqual(results["resource:tx-month"].details["gb"], 2.4)
+        self.assertEqual(results["resource:tx-rate"].details["mbps"], 10.0)
+        self.assertEqual(results["resource:cpu"].details["percent"], 10.0)
+        rg.validate_state(state)
+
+    def test_counter_that_went_backwards_or_changed_interface_only_sets_a_baseline(self):
+        for counters in (
+            stored_counters(sent=5_000_000_000, month_bytes=1_000_000_000),
+            dict(
+                stored_counters(sent=10, month_bytes=1_000_000_000),
+                tx={"sampled_at": "2026-11-20T00:00:00Z", "interface": "eth9", "bytes": 10},
+            ),
+        ):
+            with self.subTest(counters["tx"]["interface"]):
+                self.host.sleeps.clear()
+                self.host.tx(1_000)
+                results = self.check(counters)
+                self.assertEqual(counters["tx_month"]["bytes"], 1_000_000_000)
+                self.assertEqual(counters["tx"]["bytes"], 1_000)
+                self.assertEqual(counters["tx"]["interface"], "enp0s6")
+                # The rate has no stored start, so it is sampled.
+                self.assertEqual(self.host.sleeps, [5.0])
+                self.assertEqual(results["resource:tx-rate"].details["mbps"], 0.0)
+
+    def test_unreadable_counters_fail_the_target_and_keep_what_was_stored(self):
+        counters = stored_counters(busy=1, total=2, sent=3, month_bytes=4)
+        before = json.loads(json.dumps(counters))
+        (self.host.root / "stat").unlink()
+        (self.host.root / "meminfo").write_text("MemTotal: 10 kB\n", encoding="ascii")
+        (self.host.root / "net" / "dev").unlink()
+        results = self.check(counters)
+
+        self.assertEqual({target_id: result.reasons for target_id, result in results.items()}, {
+            "resource:cpu": ["CPU query FileNotFoundError"],
+            "resource:memory": ["memory query KeyError"],
+            "resource:disk:/": [],
+            "resource:tx-rate": ["network query FileNotFoundError"],
+            "resource:tx-month": ["network query FileNotFoundError"],
+        })
+        self.assertFalse(results["resource:cpu"].probe_ok)
+        self.assertEqual(
+            results["resource:tx-month"].details,
+            {"gb": None, "limit": 8000.0, "month": None, "interface": "enp0s6"},
+        )
+        self.assertEqual(counters, before)
+        self.assertEqual(self.host.sleeps, [])
+
+    def test_sample_that_cannot_be_finished_fails_only_the_averages(self):
+        # Nothing advances during the wait, and then the interface disappears.
+        self.host.tx(1_000)
+        self.host.during_sleep = (self.host.root / "net" / "dev").unlink
+        counters = rg.default_resource_state()
+        results = self.check(counters)
+        self.assertEqual(results["resource:cpu"].reasons, ["CPU counters did not advance"])
+        self.assertEqual(results["resource:tx-rate"].reasons, ["network query FileNotFoundError"])
+        self.assertEqual(results["resource:tx-month"].reasons, [])
+        self.assertEqual(counters["tx"]["bytes"], 1_000)
+
+    def test_interface_is_the_default_route_unless_configured(self):
+        self.host.tx(500)
+        tailscale = self.check(stored_counters(), resource_net_interface="tailscale0")
+        self.assertEqual(tailscale["resource:tx-rate"].details["interface"], "tailscale0")
+        missing = self.check(stored_counters(), resource_net_interface="eth9")
+        self.assertEqual(missing["resource:tx-rate"].reasons, ["interface eth9 not found"])
+        self.assertEqual(missing["resource:tx-month"].reasons, ["interface eth9 not found"])
+
+        (self.host.root / "net" / "route").write_text(ROUTE_HEADER, encoding="ascii")
+        no_route = self.check(stored_counters())
+        self.assertEqual(
+            no_route["resource:tx-rate"].reasons, ["no default route; set RESOURCE_NET_INTERFACE"]
+        )
+        self.assertIsNone(no_route["resource:tx-rate"].details["interface"])
+
+    def test_zero_turns_a_target_off_and_its_files_are_never_read(self):
+        import shutil
+
+        monitor = self.monitor(resource_cpu_max=0, resource_net_tx_mbps=0, resource_net_month_tx_gb=0)
+        self.assertEqual(monitor.target_ids(), ["resource:memory", "resource:disk:/"])
+        (self.host.root / "stat").unlink()
+        shutil.rmtree(self.host.root / "net")
+        results = monitor.check()
+        self.assertEqual([result.target_id for result in results], monitor.target_ids())
+        self.assertTrue(all(result.healthy for result in results))
+        self.assertEqual(self.host.sleeps, [])
+
+    def test_month_total_alone_never_needs_a_sample(self):
+        counters = rg.default_resource_state()
+        overrides = dict(resource_cpu_max=0, resource_net_tx_mbps=0)
+        self.host.tx(1_000)
+        first = self.check(counters, "2026-11-20T00:00:00Z", **overrides)
+        self.host.tx(1_000 + 2_000_000_000)
+        second = self.check(counters, **overrides)
+        self.assertNotIn("resource:tx-rate", second)
+        self.assertEqual(first["resource:tx-month"].details["gb"], 0.0)
+        self.assertEqual(second["resource:tx-month"].details["gb"], 2.0)
+        self.assertEqual(self.host.sleeps, [])
+
+    def test_recover_is_never_an_action(self):
+        self.assertEqual(self.monitor().recover("resource:cpu"), (False, "no recovery action"))
+
+
+class ResourceStateTests(unittest.TestCase):
+    def setUp(self):
+        self.now = at("2026-11-20T00:00:00Z")
+
+    def test_schema_three_gains_empty_counters_and_keeps_every_target(self):
+        old = schema3_state(self.now)
+        old["targets"][BOINC]["consecutive_failures"] = 7
+        state = rg.migrate_state(json.loads(json.dumps(old)), "boot", self.now)
+        self.assertEqual(state["schema_version"], 4)
+        self.assertEqual(state["resource"], {"cpu": None, "tx": None, "tx_month": None})
+        self.assertEqual(state["monitor"], "boinc,process")
+        self.assertEqual(state["targets"], old["targets"])
+        self.assertEqual(state["current_week"], old["current_week"])
+
+    def test_schema_three_migration_is_persisted_on_load(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_text(json.dumps(schema3_state(self.now)), encoding="utf-8")
+            _, backup = rg.StateStore(path).load("boot", self.now, "boinc,process")
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            self.assertIsNone(backup)
+            self.assertEqual(persisted["schema_version"], 4)
+            self.assertEqual(list(persisted["targets"]), [BOINC, "service:tailscaled.service"])
+
+    def test_older_schemas_also_arrive_with_counters(self):
+        state = rg.migrate_state(schema2_state(), "boot", at("2026-09-02T09:00:00Z"))
+        self.assertEqual(state["resource"], rg.default_resource_state())
+
+    def test_broken_counters_are_invalid_state(self):
+        for broken in (
+            {"cpu": None, "tx": None},
+            {"cpu": {"sampled_at": "2026-11-20T00:00:00Z", "busy": -1, "total": 1}},
+            {"cpu": {"sampled_at": None, "busy": 1, "total": 1}},
+            {"tx": {"sampled_at": None, "interface": "", "bytes": 0}},
+            {"tx": {"sampled_at": "yesterday", "interface": "eth0", "bytes": 0}},
+            {"tx_month": {"month": "2026-11", "bytes": 1.5}},
+            {"tx_month": "2026-11"},
+        ):
+            with self.subTest(broken):
+                state = rg.default_state("boot", self.now, "resource")
+                if len(broken) == 2:
+                    state["resource"] = broken
+                else:
+                    state["resource"].update(broken)
+                with self.assertRaises(rg.InvalidStateError):
+                    rg.validate_state(state)
+
+    def test_resource_target_ids_name_a_known_metric(self):
+        for target_id in RESOURCE_IDS + ["resource:disk:/var/lib"]:
+            state = rg.default_state("boot", self.now, "resource")
+            rg.sync_targets(state, "resource", [target_id])
+            rg.validate_state(state)
+        for target_id in ("resource:load", "resource:disk", "resource:disk:var", "resource:cpu:/"):
+            with self.subTest(target_id):
+                state = rg.default_state("boot", self.now, "resource")
+                rg.sync_targets(state, "resource", [target_id])
+                with self.assertRaises(rg.InvalidStateError):
+                    rg.validate_state(state)
+
+    def test_details_are_numbers_or_missing(self):
+        state = rg.default_state("boot", self.now, "resource")
+        rg.sync_targets(state, "resource", ["resource:cpu"])
+        missing = rg.TargetResult(
+            "resource:cpu", ["CPU query OSError"],
+            {"percent": None, "limit": 90.0, "window_seconds": None}, probe_ok=False,
+        )
+        rg.apply_result(state, missing, self.now, 2)
+        rg.validate_state(state)
+        state["targets"]["resource:cpu"]["last_check"]["details"]["percent"] = "high"
+        with self.assertRaises(rg.InvalidStateError):
+            rg.validate_state(state)
+
+
+class ResourceIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.path = self.root / "state.json"
+        self.host = FakeHost(self.root / "proc")
+        self.notifier = FakeNotifier(True)
+        self.now = at("2026-11-20T00:00:00Z")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def settings(self, **overrides):
+        values = dict(monitor="resource", state_file=self.path, proc_root=self.host.root)
+        values.update(overrides)
+        return rg.Settings(**values)
+
+    def sentinel(self, settings=None, monitor=None):
+        settings = settings or self.settings()
+        return rg.Sentinel(
+            settings, rg.StateStore(self.path), monitor or self.host.monitor(settings),
+            self.notifier, "host", boot_id_reader=lambda: "boot",
+        )
+
+    def persisted(self):
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def test_sustained_cpu_opens_an_incident_then_recovers_without_any_recovery_action(self):
+        sentinel = self.sentinel(self.settings(
+            resource_memory_max=0, resource_disk_max=0, resource_net_tx_mbps=0,
+            resource_net_month_tx_gb=0,
+        ))
+        self.host.during_sleep = lambda: self.host.cpu(busy=95, nice=0, idle=1005)
+        sentinel.check(self.now)
+        self.assertEqual(self.notifier.messages, [])
+        self.assertEqual(self.persisted()["targets"]["resource:cpu"]["health"], "degraded")
+
+        self.host.cpu(busy=9_500, nice=0, idle=1_500)
+        sentinel.check(self.now + timedelta(minutes=15))
+        self.assertEqual(self.notifier.messages, [
+            "🚨 Sentinel 장애: host resource:cpu; 시작=2026-11-20T00:00:00Z, 연속 실패=2회; "
+            "CPU=95.0% (nice 제외, 15분 평균), 원인=CPU 95.0% > 90%"
+        ])
+
+        # BOINC takes the CPU back at nice 19; that is not usage.
+        self.host.cpu(busy=9_600, nice=9_000, idle=2_400)
+        sentinel.check(self.now + timedelta(minutes=30))
+        self.assertEqual(self.notifier.messages[1:], [
+            "✅ Sentinel 복구: host resource:cpu; 장애 시작=2026-11-20T00:00:00Z, "
+            "복구=2026-11-20T00:30:00Z; CPU=1.0% (nice 제외, 15분 평균), 원인=없음"
+        ])
+        target = self.persisted()["targets"]["resource:cpu"]
+        self.assertIsNone(target["last_recovery_at"])
+        self.assertEqual(self.host.sleeps, [5.0])
+
+    def test_each_metric_words_its_own_alert(self):
+        self.host.memory(available_kb=500_000)
+        self.host.disks["/"] = (1000, 60, 10)
+        counters = stored_counters(month_bytes=8_100_000_000_000)
+        state = rg.default_state("boot", self.now, "resource")
+        state["resource"] = counters
+        rg.StateStore(self.path).save(state)
+        self.host.tx(11_250_000_000)
+        self.host.cpu(busy=0, nice=0, idle=1000)
+
+        sentinel = self.sentinel()
+        sentinel.check(self.now + timedelta(minutes=15))
+        self.host.tx(22_500_000_000)
+        self.host.cpu(busy=0, nice=0, idle=2000)
+        sentinel.check(self.now + timedelta(minutes=30))
+
+        prefix = "🚨 Sentinel 장애: host "
+        middle = "; 시작=2026-11-20T00:15:00Z, 연속 실패=2회; "
+        alerts = dict(message[len(prefix):].split(middle) for message in self.notifier.messages)
+        self.assertEqual(alerts, {
+            "resource:memory": "메모리=95.0% (가용 488MiB/9765MiB), 원인=memory 95.0% > 90%",
+            "resource:disk:/": "디스크=98.9% (여유 10.0GiB/1000.0GiB), 원인=disk 98.9% > 90%",
+            "resource:tx-rate": "송신=100.00Mbps (enp0s6, 15분 평균), 원인=TX 100.00Mbps > 30Mbps",
+            "resource:tx-month": (
+                "이번 달 송신=8122.5GB (2026-11, enp0s6), 원인=month TX 8122.5GB > 8000GB"
+            ),
+        })
+        self.assertTrue(all(message.startswith(prefix) for message in self.notifier.messages))
+
+    def test_counters_travel_between_runs_in_the_state_file(self):
+        self.host.tx(1_000)
+        self.host.during_sleep = lambda: self.host.cpu(busy=10, nice=0, idle=1090)
+        self.sentinel().check(self.now)
+        first = self.persisted()
+        self.assertEqual(first["schema_version"], 4)
+        self.assertEqual(sorted(first["targets"]), sorted(RESOURCE_IDS))
+        self.assertEqual(first["resource"], stored_counters(busy=0, total=1000, sent=1_000))
+
+        self.host.tx(1_000 + 4_000_000_000)
+        self.host.cpu(busy=20, nice=0, idle=2080)
+        self.sentinel().check(self.now + timedelta(minutes=15))
+        second = self.persisted()
+        self.assertEqual(second["resource"]["tx_month"], {"month": "2026-11", "bytes": 4_000_000_000})
+        self.assertEqual(second["resource"]["cpu"]["sampled_at"], "2026-11-20T00:15:00Z")
+        self.assertEqual(self.host.sleeps, [5.0])
+        self.assertEqual(self.notifier.messages, [])
+
+    def test_reboot_keeps_the_month_and_drops_the_other_counters(self):
+        self.host.tx(900_000_000)
+        self.host.during_sleep = lambda: self.host.cpu(busy=10, nice=0, idle=1090)
+        self.sentinel().check(self.now)
+        self.host.tx(900_000_000 + 100_000_000)
+        self.host.cpu(busy=20, nice=0, idle=2080)
+        self.sentinel().check(self.now + timedelta(minutes=15))
+
+        # The counters restart with the kernel.
+        self.host.cpu(busy=1, nice=0, idle=99)
+        self.host.tx(50_000_000)
+        self.host.during_sleep = lambda: self.host.cpu(busy=2, nice=0, idle=198)
+        rebooted = self.sentinel()
+        rebooted.boot_id_reader = lambda: "boot-2"
+        rebooted.check(self.now + timedelta(minutes=30))
+        persisted = self.persisted()
+        self.assertEqual(persisted["resource"]["tx_month"]["bytes"], 150_000_000)
+        self.assertEqual(self.host.sleeps, [5.0, 5.0])
+        self.assertEqual(len(self.notifier.messages), 1)
+        self.assertTrue(self.notifier.messages[0].startswith("🔄 Sentinel 재부팅 감지: host"))
+
+    def test_resource_joins_boinc_and_services_in_one_run(self):
+        targets = self.root / "targets"
+        targets.write_text("service tailscaled\n", encoding="utf-8")
+        settings = self.settings(monitor="boinc,process,resource", targets_file=targets)
+        settings.validate()
+        built = rg.build_monitor(settings)
+        self.assertIsInstance(built, rg.CompositeMonitor)
+        self.assertEqual(built.name, "boinc,process,resource")
+        self.assertEqual(
+            built.target_ids(), [BOINC, "service:tailscaled.service"] + RESOURCE_IDS
+        )
+        self.assertIsInstance(rg.build_monitor(self.settings()), rg.ResourceMonitor)
+
+        resource = self.host.monitor(settings)
+        monitor = rg.CompositeMonitor(settings.monitor, [
+            rg.BoincMonitor(
+                settings, probe=FakeProbe(rg.CheckResult(True, 1, 50.0)), recovery=FakeRecovery()
+            ),
+            resource,
+        ])
+        self.host.during_sleep = lambda: self.host.cpu(busy=10, nice=900, idle=190)
+        self.sentinel(settings, monitor).check(self.now)
+        persisted = self.persisted()
+        self.assertEqual(sorted(persisted["targets"]), sorted([BOINC] + RESOURCE_IDS))
+        self.assertEqual(persisted["monitor"], "boinc,process,resource")
+        self.assertEqual(
+            {target["health"] for target in persisted["targets"].values()}, {"healthy"}
+        )
+        # The monitor advanced the state's own counters, so they were saved with it.
+        self.assertEqual(resource.counters, persisted["resource"])
+        self.assertEqual(persisted["resource"]["cpu"]["total"], 1000)
+        self.assertEqual(persisted["current_week"]["checks"], 1)
+
+    def test_schema_three_state_keeps_its_incident_when_resource_is_added(self):
+        old = schema3_state(self.now)
+        old["monitor"] = "boinc"
+        del old["targets"]["service:tailscaled.service"]
+        old["targets"][BOINC].update(
+            health="unhealthy",
+            consecutive_failures=3,
+            incident_started_at="2026-11-19T23:00:00Z",
+            incident_confirmed=True,
+            incident_alert_sent=True,
+            last_alert_at="2026-11-19T23:15:00Z",
+        )
+        self.path.write_text(json.dumps(old), encoding="utf-8")
+        settings = self.settings(monitor="boinc,resource")
+        monitor = rg.CompositeMonitor(settings.monitor, [
+            rg.BoincMonitor(
+                settings, probe=FakeProbe(rg.CheckResult(True, 0, 0.0)), recovery=FakeRecovery()
+            ),
+            self.host.monitor(settings),
+        ])
+        self.host.during_sleep = lambda: self.host.cpu(busy=10, nice=0, idle=1090)
+        self.sentinel(settings, monitor).check(self.now)
+        persisted = self.persisted()
+        self.assertEqual(persisted["schema_version"], 4)
+        self.assertEqual(persisted["targets"][BOINC]["consecutive_failures"], 4)
+        self.assertEqual(persisted["targets"][BOINC]["incident_started_at"], "2026-11-19T23:00:00Z")
+        self.assertEqual(sorted(persisted["targets"]), sorted([BOINC] + RESOURCE_IDS))
+
+    def test_weekly_summary_adds_the_month_to_date_traffic(self):
+        now = at("2026-11-23T00:30:00Z")
+        state = rg.default_state("boot", now, "resource")
+        rg.sync_targets(state, "resource", ["resource:tx-month"])
+        month = rg.TargetResult(
+            "resource:tx-month", [],
+            {"gb": 1234.56, "limit": 8000.0, "month": "2026-11", "interface": "enp0s6"},
+        )
+        rg.apply_result(state, month, now, 2)
+        state["pending_weekly"] = {
+            "start_week": "2026-W47",
+            "end_week": "2026-W47",
+            "checks": 672,
+            "failures": 0,
+            "incidents": 0,
+            "restarts": 0,
+            "due_at": "2026-11-23T00:00:00Z",
+        }
+        weekly = [note for note in rg.pending_notifications(state, now, "host", 12)][-1]
+        self.assertEqual(weekly.message, (
+            "📊 Sentinel 주간 요약: host 2026-W47 점검=672 대상 실패=0 장애=0 재시작=0 현재=정상; "
+            "이번 달 송신=1234.6GB/기준 8000GB"
+        ))
+
+    def stored_state(self, boot_id="boot"):
+        state = rg.default_state(boot_id, self.now, "resource")
+        state["resource"] = stored_counters(
+            busy=0, total=0, sent=1_000_000_000, month_bytes=4_000_000_000
+        )
+        rg.StateStore(self.path).save(state)
+        return self.path.read_bytes()
+
+    def check_config(self):
+        settings = self.settings()
+        lines = []
+        status = rg.check_config(
+            settings, self.host.monitor(settings), out=lines.append,
+            boot_id_reader=lambda: "boot", now=self.now + timedelta(minutes=10),
+        )
+        self.assertEqual(status, 0)
+        return lines
+
+    def test_check_config_starts_from_the_stored_counters_and_writes_nothing(self):
+        before = self.stored_state()
+        self.host.tx(1_500_000_000)
+        lines = self.check_config()
+        self.assertEqual(lines[0], "monitor=resource targets=5")
+        self.assertEqual(
+            lines[1], "ok   resource:cpu percent=0.0 limit=90.0 window_seconds=600 reasons=none"
+        )
+        self.assertEqual(
+            lines[5],
+            "ok   resource:tx-month gb=4.5 limit=8000.0 month=2026-11 interface=enp0s6 reasons=none",
+        )
+        self.assertEqual(self.host.sleeps, [])
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_check_config_after_a_reboot_does_not_trust_the_old_counters(self):
+        before = self.stored_state("previous-boot")
+        self.host.tx(1_500_000_000)
+        self.host.during_sleep = lambda: self.host.cpu(busy=10, nice=0, idle=1090)
+        lines = self.check_config()
+        self.assertEqual(self.host.sleeps, [5.0])
+        self.assertTrue(
+            lines[1].startswith("ok   resource:cpu percent=10.0 limit=90.0 window_seconds=5 ")
+        )
+        self.assertIn(" gb=5.5 ", lines[5])
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_check_config_without_a_usable_state_file_samples(self):
+        self.host.during_sleep = lambda: self.host.cpu(busy=10, nice=0, idle=1090)
+        for content in (None, "{broken", json.dumps(schema3_state(self.now))):
+            with self.subTest(content):
+                self.host.sleeps.clear()
+                self.host.cpu(busy=0, nice=0, idle=1000)
+                if content is not None:
+                    self.path.write_text(content, encoding="utf-8")
+                lines = self.check_config()
+                self.assertEqual(self.host.sleeps, [5.0])
+                self.assertIn(" gb=0.0 ", lines[5])
+                if content is None:
+                    self.assertFalse(self.path.exists())
+                else:
+                    self.assertEqual(self.path.read_text(encoding="utf-8"), content)
+
+
 class UnitTests(unittest.TestCase):
     def read(self, relative):
         return (ROOT / "systemd" / relative).read_text(encoding="utf-8")
@@ -1761,6 +2617,19 @@ class UnitTests(unittest.TestCase):
     def test_fast_timer_resets_the_calendar(self):
         dropin = self.read("sentinel.timer.d/interval.conf")
         self.assertIn("OnCalendar=\nOnCalendar=*:0/5\n", dropin)
+
+    def test_base_unit_leaves_the_host_counters_visible(self):
+        unit = self.read("sentinel.service")
+        # The resource monitor reads /proc/stat, /proc/meminfo and /proc/net.
+        self.assertNotIn("ProcSubset=", unit)
+        self.assertNotIn("PrivateNetwork=", unit)
+        # RESOURCE_DISK_PATHS refuses exactly what this hides.
+        self.assertIn("ProtectHome=yes\n", unit)
+
+    def test_installer_knows_every_monitor(self):
+        script = (ROOT / "install.sh").read_text(encoding="utf-8")
+        self.assertIn(f"{'|'.join(rg.MONITORS)}) seen", script)
+        self.assertIn(f"for name in {' '.join(rg.MONITORS)}; do", script)
 
 
 if __name__ == "__main__":

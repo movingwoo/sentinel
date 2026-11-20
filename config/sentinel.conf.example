@@ -2,8 +2,9 @@
 # Keep the bot token out of this file; it belongs in telegram-token.
 TELEGRAM_CHAT_ID=
 
-# What this Sentinel watches: boinc (option 1), process (option 2) or
-# docker (option 3), or several comma-separated, e.g. boinc,process.
+# What this Sentinel watches: boinc (option 1), process (option 2),
+# docker (option 3) or resource (option 4), or several comma-separated,
+# e.g. boinc,process,resource.
 # install.sh appends this line; a missing value means boinc.
 # SENTINEL_MONITOR=boinc
 
@@ -13,7 +14,7 @@ TELEGRAM_CHAT_ID=
 # STATE_FILE=/var/lib/sentinel/state.json
 # COMMAND_TIMEOUT=8
 
-# Auto-recovery, shared by both options. RECOVER_ENABLED=0 turns it off.
+# Auto-recovery for options 1 to 3. RECOVER_ENABLED=0 turns it off.
 # RECOVER_ENABLED=1
 # RECOVER_AFTER_FAILURES=1
 # RECOVER_COOLDOWN_HOURS=6
@@ -49,3 +50,31 @@ TELEGRAM_CHAT_ID=
 
 # Option 3 (docker) only.
 # DOCKER_SOCKET=/var/run/docker.sock
+
+# Option 4 (resource). A target fails while its reading is over the limit and
+# alerts after ALERT_AFTER_FAILURES checks in a row; nothing is recovered
+# automatically. 0 turns a target off. Check a change with
+# `sudo /usr/local/sbin/sentinel check-config`.
+#
+# CPU and the transmit rate are averages over the time since the previous run
+# (15 minutes with boinc, 5 minutes without).
+#
+# CPU percent of all vCPUs, not counting nice processes such as BOINC tasks.
+# RESOURCE_CPU_MAX=90
+# Memory in use, from MemAvailable.
+# RESOURCE_MEMORY_MAX=90
+# Disk in use, the Use% of df, for each comma-separated path. Paths under
+# /home, /root and /run/user are refused: the unit cannot see them.
+# RESOURCE_DISK_MAX=90
+# RESOURCE_DISK_PATHS=/
+#
+# Outbound traffic. Empty picks the interface of the IPv4 default route.
+# RESOURCE_NET_INTERFACE=
+# Average transmit rate in Mbit/s. The defaults follow Oracle Cloud's Always
+# Free allowance of 10 TB of outbound data per month: 30 Mbit/s kept up for a
+# whole month is about 10 TB.
+# RESOURCE_NET_TX_MBPS=30
+# Outbound total of the calendar month (UTC) in GB, counted by Sentinel since
+# it was installed. 8000 is 80% of the 10 TB. Other instances of the tenancy
+# are not counted.
+# RESOURCE_NET_MONTH_TX_GB=8000

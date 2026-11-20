@@ -7,9 +7,10 @@
 1. `boinc`: BOINC 서비스와 CPU 사용량 감시 (기존 동작)
 2. `process`: 등록한 systemd 서비스나 프로세스의 생존과 재시작 감시
 3. `docker`: 등록한 Docker 컨테이너의 생존, healthcheck, 재시작 감시
+4. `resource`: 서버 CPU, 메모리, 디스크, 송신 트래픽이 기준을 넘는지 감시
 
 `/etc/sentinel/sentinel.conf`의 `SENTINEL_MONITOR`로 정함. 값이 없으면 `boinc`.  
-쉼표로 묶으면 한 번의 실행에서 모두 점검함 (예: `SENTINEL_MONITOR=boinc,process`로 BOINC와 tailscaled를 같이 감시).
+쉼표로 묶으면 한 번의 실행에서 모두 점검함 (예: `SENTINEL_MONITOR=boinc,process,resource`로 BOINC, tailscaled, 서버 자원을 같이 감시).
 대상마다 장애·자동복구·쿨다운이 따로 관리되고, 자동복구는 그 대상을 맡은 옵션의 방식으로 실행됨.
 `process`와 `docker`를 함께 쓰면 targets 파일 하나에 두 종류를 같이 적음.
 셸에서 `sudo /usr/local/sbin/sentinel ...`로 직접 실행해도 이 파일을 읽으므로 timer와 같은 옵션으로 동작함.
@@ -107,6 +108,38 @@ systemd는 호출자의 capability를 볼 수 있으면 root라도 `CAP_SYS_ADMI
 - `unhealthy`: `POST /containers/<name>/restart`. Docker는 unhealthy 컨테이너를 스스로 재시작하지 않음
 - `docker stop`으로 멈춘 컨테이너(0, 143, grace 초과 137)와 `restarting`, `paused`는 건드리지 않음
 
+## 4옵션 `resource` 동작
+
+- 대상은 targets 파일이 아니라 `sentinel.conf`의 기준값으로 정해짐. 기준이 `0`이면 그 대상은 없음
+- 측정값이 기준을 **넘으면** 실패. 2회 연속이면 장애 알림, 지속되면 12시간마다 재알림, 내려가면 복구 알림. 대상마다 따로 돌아감
+- 자동복구는 없고 알림만 함
+- 기준을 고치면 `sudo /usr/local/sbin/sentinel check-config`로 지금 값과 적용된 기준(`limit=`)을 바로 확인
+
+| 대상 | 설정 (기본값) | 측정 |
+| --- | --- | --- |
+| `resource:cpu` | `RESOURCE_CPU_MAX=90` | 전체 vCPU 대비 %, 직전 실행 이후 평균. nice 프로세스 제외 |
+| `resource:memory` | `RESOURCE_MEMORY_MAX=90` | 사용 %, `MemAvailable` 기준 |
+| `resource:disk:<경로>` | `RESOURCE_DISK_MAX=90`, `RESOURCE_DISK_PATHS=/` | `df`의 Use%와 같은 계산. 경로는 쉼표로 여러 개 |
+| `resource:tx-rate` | `RESOURCE_NET_TX_MBPS=30` | 송신 Mbps, 직전 실행 이후 평균 |
+| `resource:tx-month` | `RESOURCE_NET_MONTH_TX_GB=8000` | 이번 달(UTC) 누적 송신 GB |
+
+- 평균 구간은 timer 주기와 같음. `boinc`와 같이 쓰면 15분, 아니면 5분. 그보다 짧은 스파이크는 평균에 묻힘
+- CPU: `/proc/stat`의 user, system, irq, softirq만 사용량으로 셈. BOINC task는 nice 19로 돌면서 남는 CPU를 일부러 다 쓰므로 nice를 넣으면 늘 100%가 됨. idle, iowait, steal도 뺌
+- 송신: `/proc/net/dev`의 인터페이스 하나만 셈. `RESOURCE_NET_INTERFACE`가 비어 있으면 IPv4 기본 경로의 인터페이스. Tailscale 트래픽도 결국 그 인터페이스로 나가므로 `tailscale0`을 따로 더하지 않음
+- 직전 실행의 커널 카운터를 state에 두고 차이로 평균을 냄. 첫 실행, 재부팅 직후, 직전 실행이 1시간 넘게 지났을 때는 그 실행 안에서 5초간 재서 대신함
+- 이번 달 누적은 설치한 뒤부터 Sentinel이 센 값임. 재부팅하면 부팅 뒤 보낸 양을 그대로 더하므로 빠지는 건 재부팅 직전 한 주기뿐
+- 주간 요약 끝에 `이번 달 송신=12.3GB/기준 8000GB`가 붙음
+- `/home`, `/root`, `/run/user` 아래 경로는 `RESOURCE_DISK_PATHS`에 못 넣음. 유닛의 `ProtectHome=yes`가 그 자리를 빈 tmpfs로 가려서 엉뚱한 값이 나옴
+
+### 4옵션 기본값과 Oracle 무료분량
+
+기본값은 Oracle Cloud Always Free 기준에 맞춰둠. 다른 서버라면 숫자만 바꾸면 됨.
+
+- 송신은 월 10TB까지 무료. `RESOURCE_NET_MONTH_TX_GB=8000`은 그 80%
+- `RESOURCE_NET_TX_MBPS=30`은 한 달 내내 유지하면 약 10TB가 되는 속도. 이 속도가 이어지면 그 달 한도를 넘김
+- 누적은 이 서버 것만 셈. 무료분량은 계정에 주어지는 것이라 인스턴스가 여럿이면 기준을 그만큼 낮출 것
+- 유휴 회수(7일간 CPU 95퍼센타일, 네트워크, 메모리가 모두 20% 미만)는 "미만" 쪽 위험이라 여기서 안 봄. CPU를 30% 위로 유지하는지는 1옵션이 감시함
+
 ## 설치
 
 Ubuntu 24.04의 root 셸에서 저장소 기준
@@ -120,7 +153,8 @@ sudo ./install.sh                     # 새 설치면 선택 메뉴 (4번이 BOI
 sudo ./install.sh --monitor boinc
 sudo ./install.sh --monitor process
 sudo ./install.sh --monitor docker
-sudo ./install.sh --monitor boinc,process   # 조합
+sudo ./install.sh --monitor resource
+sudo ./install.sh --monitor boinc,process,resource   # 조합
 ```
 
 인스톨러는 기존 상태와 로컬 설정을 덮어쓰지 않음.  
@@ -131,6 +165,7 @@ BOINC를 재시작하지 않고 `systemctl daemon-reload`만 수행한 뒤 timer
 - `boinc`: `boinc` 그룹이 없으면 중단. BOINC 전용 설정(`SupplementaryGroups=boinc` 등)은 `sentinel.service.d/boinc.conf` drop-in으로만 설치되므로 BOINC 없는 서버에서도 기본 유닛이 뜸
 - 조합에 `boinc`가 있으면 timer는 15분 그대로 둠. 5분 주기는 task 사이의 짧은 공백을 일감 고갈로 잡아 파괴적인 sync를 부를 가능성을 높이기 때문
 - `process`, `docker`: targets 파일이 없으면 대상을 입력받아 만들고 `check-config`가 실패하면 timer를 켜지 않고 중단
+- `resource`: 추가 권한이나 drop-in 없음. `boinc`가 없으면 5분 timer. 이미 설치된 서버에 더하려면 설치기로 새 버전을 먼저 올린 뒤 conf의 `SENTINEL_MONITOR`에 `resource`를 더하고 `check-config`로 확인. 순서를 바꾸면 그 사이 timer가 옛 버전으로 돌아 모르는 옵션이라며 한 번 실패함
 
 기존 Telegram bot의 chat ID를 root 전용 설정에 기록해야 함.
 
@@ -162,12 +197,13 @@ sudo /usr/local/sbin/sentinel show-state
 상태는 `/var/lib/sentinel/state.json` 하나이며 systemd `StateDirectory`가 만든 `0700 root:root` 디렉터리에 `0600 root:root`로 저장.  
 같은 디렉터리의 임시 파일을 `fsync`하고 `os.replace()`로 교체.
 
-- 부팅 ID 변경: 대상마다 연속 실패 횟수, 장애당 복구 시도 횟수, 재시작 기준값을 초기화. 쿨다운은 재부팅으로 풀리지 않음
+- 부팅 ID 변경: 대상마다 연속 실패 횟수, 장애당 복구 시도 횟수, 재시작 기준값을 초기화. 쿨다운은 재부팅으로 풀리지 않음. 4옵션의 CPU·송신 카운터도 새로 시작하고 이번 달 누적은 유지
 - 주 변경: 지난 카운터를 고정 크기 pending summary로 옮김
 - 손상된 JSON: `state.json.corrupt-<UTC>`로 보존, 초기화 알림을 재시도
-- schema 0, 1, 2: schema 3으로 마이그레이션. BOINC 장애 이력과 자동복구 기록은 `targets.boinc`로 옮겨지고 카운터는 보존
+- schema 0, 1, 2: BOINC 장애 이력과 자동복구 기록을 `targets.boinc`로 옮기고 카운터는 보존한 채 schema 4로 마이그레이션
+- schema 3: 4옵션의 카운터 자리(`resource`)만 더해 schema 4로 마이그레이션. 대상과 이력은 그대로
 - targets 파일에서 빠진 대상: 상태에서 지우고 journal에 남김
-- 더 새로운 schema: 파일을 수정하지 않고 서비스가 오류로 종료
+- 더 새로운 schema: 파일을 수정하지 않고 서비스가 오류로 종료. schema 4를 쓴 뒤에는 이전 버전으로 되돌릴 수 없으므로 올리기 전에 `state.json`을 백업해 둘 것
 
 수동 초기화도 파일을 삭제하지 않고 timestamp 백업을 만듦.
 

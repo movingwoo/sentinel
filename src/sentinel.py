@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sentinel: BOINC, service/process or Docker health checks with Telegram alerts."""
+"""Sentinel: BOINC, service/process, Docker and host resource checks with Telegram alerts."""
 
 from __future__ import annotations
 
@@ -25,15 +25,32 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 KST = timezone(timedelta(hours=9), name="KST")
 LOGGER = logging.getLogger("sentinel")
 EXECUTING_RE = re.compile(r"^\s*active_task_state\s*:\s*EXECUTING\s*$", re.MULTILINE)
 
-MONITORS = ("boinc", "process", "docker")
+MONITORS = ("boinc", "process", "docker", "resource")
 BOINC_TARGET = "boinc"
-TARGET_KINDS = ("service", "process", "cmdline", "container")
+TARGET_KINDS = ("service", "process", "cmdline", "container", "resource")
 MONITOR_KINDS = {"process": ("service", "process", "cmdline"), "docker": ("container",)}
+# resource:<metric> targets, with the numeric and the text fields of their
+# details. Only disk carries a path: resource:disk:/var.
+RESOURCE_DETAILS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "cpu": (("percent", "limit", "window_seconds"), ()),
+    "memory": (("percent", "limit", "available_mib", "total_mib"), ()),
+    "disk": (("percent", "limit", "free_gib", "total_gib"), ()),
+    "tx-rate": (("mbps", "limit", "window_seconds"), ("interface",)),
+    "tx-month": (("gb", "limit"), ("month", "interface")),
+}
+TX_MONTH_TARGET = "resource:tx-month"
+# Without usable counters from the previous run, CPU and the transmit rate
+# are sampled inside the run for this long.
+RESOURCE_SAMPLE_SECONDS = 5.0
+# Counters older than this no longer say what the host is doing now.
+RESOURCE_WINDOW_MAX_SECONDS = 3600.0
+# sentinel.service sets ProtectHome=yes, which shows these as an empty tmpfs.
+HIDDEN_DISK_PATHS = ("/home", "/root", "/run/user")
 # Kinds whose restart marker is a counter of supervisor restarts.
 COUNTER_KINDS = ("service", "container")
 CONFIG_FILE = Path("/etc/sentinel/sentinel.conf")
@@ -194,6 +211,11 @@ def target_kind(target_id: str) -> str:
     return target_id.partition(":")[0]
 
 
+def resource_metric(target_id: str) -> str:
+    """The metric of a resource target: resource:cpu is cpu, resource:disk:/var is disk."""
+    return target_id.split(":", 2)[1]
+
+
 def _counter_block(key: str) -> dict[str, Any]:
     return {"week": key, "checks": 0, "failures": 0, "incidents": 0, "restarts": 0}
 
@@ -217,12 +239,18 @@ def default_target_state() -> dict[str, Any]:
     }
 
 
+def default_resource_state() -> dict[str, Any]:
+    """The kernel counters the resource monitor carries from one run to the next."""
+    return {"cpu": None, "tx": None, "tx_month": None}
+
+
 def default_state(boot_id: str, now: datetime, monitor: str = "boinc") -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "monitor": monitor,
         "boot_id": boot_id,
         "targets": {},
+        "resource": default_resource_state(),
         "pending_state_reset_alert": None,
         "pending_boot_alert": None,
         "current_week": _counter_block(week_key(now)),
@@ -236,6 +264,17 @@ def _is_nonnegative_int(value: Any) -> bool:
 
 def _is_optional_str(value: Any) -> bool:
     return value is None or isinstance(value, str)
+
+
+def _is_optional_number(value: Any) -> bool:
+    if value is None:
+        return True
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    )
 
 
 def _validate_counter(value: Any, pending: bool = False) -> None:
@@ -260,6 +299,11 @@ def _validate_target_id(target_id: Any) -> None:
     kind, separator, value = target_id.partition(":")
     if not separator or kind not in TARGET_KINDS or not value:
         raise InvalidStateError(f"target ID is invalid: {target_id!r}")
+    if kind == "resource":
+        metric, _, path = value.partition(":")
+        path_fits = path.startswith("/") if metric == "disk" else not path
+        if metric not in RESOURCE_DETAILS or not path_fits:
+            raise InvalidStateError(f"target ID is invalid: {target_id!r}")
 
 
 def _validate_details(target_id: str, details: Any) -> None:
@@ -294,6 +338,14 @@ def _validate_details(target_id: str, details: Any) -> None:
         for key in ("restart_count", "exit_code"):
             value = details.get(key)
             if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
+                raise InvalidStateError(f"{target_id} last_check.{key} is invalid")
+    elif kind == "resource":
+        numbers, texts = RESOURCE_DETAILS[resource_metric(target_id)]
+        for key in numbers:
+            if not _is_optional_number(details.get(key)):
+                raise InvalidStateError(f"{target_id} last_check.{key} is invalid")
+        for key in texts:
+            if not _is_optional_str(details.get(key)):
                 raise InvalidStateError(f"{target_id} last_check.{key} is invalid")
     elif not _is_nonnegative_int(details.get("count")):
         raise InvalidStateError(f"{target_id} last_check.count is invalid")
@@ -369,6 +421,37 @@ def _validate_target(target_id: str, target: Any) -> None:
             raise InvalidStateError("pending_restart.detail is invalid")
 
 
+def _validate_resource(value: Any) -> None:
+    if not isinstance(value, dict) or set(default_resource_state()).difference(value):
+        raise InvalidStateError("resource is invalid")
+    cpu = value["cpu"]
+    if cpu is not None:
+        if not isinstance(cpu, dict):
+            raise InvalidStateError("resource.cpu is invalid")
+        required_utc(cpu.get("sampled_at"), "resource.cpu.sampled_at")
+        for key in ("busy", "total"):
+            if not _is_nonnegative_int(cpu.get(key)):
+                raise InvalidStateError(f"resource.cpu.{key} is invalid")
+    tx = value["tx"]
+    if tx is not None:
+        if not isinstance(tx, dict):
+            raise InvalidStateError("resource.tx is invalid")
+        # None after a reboot: the counter baseline is known, its time is not.
+        parse_utc(tx.get("sampled_at"))
+        if not isinstance(tx.get("interface"), str) or not tx["interface"]:
+            raise InvalidStateError("resource.tx.interface is invalid")
+        if not _is_nonnegative_int(tx.get("bytes")):
+            raise InvalidStateError("resource.tx.bytes is invalid")
+    month = value["tx_month"]
+    if month is not None:
+        if not isinstance(month, dict):
+            raise InvalidStateError("resource.tx_month is invalid")
+        if not isinstance(month.get("month"), str) or not month["month"]:
+            raise InvalidStateError("resource.tx_month.month is invalid")
+        if not _is_nonnegative_int(month.get("bytes")):
+            raise InvalidStateError("resource.tx_month.bytes is invalid")
+
+
 def validate_state(state: Any) -> dict[str, Any]:
     if not isinstance(state, dict):
         raise InvalidStateError("state root is not an object")
@@ -377,6 +460,7 @@ def validate_state(state: Any) -> dict[str, Any]:
         "monitor",
         "boot_id",
         "targets",
+        "resource",
         "pending_state_reset_alert",
         "pending_boot_alert",
         "current_week",
@@ -396,6 +480,7 @@ def validate_state(state: Any) -> dict[str, Any]:
     for target_id, target in state["targets"].items():
         _validate_target_id(target_id)
         _validate_target(target_id, target)
+    _validate_resource(state["resource"])
     reset = state["pending_state_reset_alert"]
     if reset is not None:
         if not isinstance(reset, dict):
@@ -416,7 +501,7 @@ def validate_state(state: Any) -> dict[str, Any]:
 
 
 # Keys of the schema 1/2 flat layout, where the single BOINC incident lived at
-# the state root. Schema 3 moves them under targets.boinc.
+# the state root. Schema 3 moved them under targets.boinc.
 _FLAT_INCIDENT_KEYS = (
     "health",
     "consecutive_failures",
@@ -510,6 +595,7 @@ def _upgrade_flat(flat: dict[str, Any]) -> dict[str, Any]:
         "monitor": "boinc",
         "boot_id": flat["boot_id"],
         "targets": {BOINC_TARGET: target},
+        "resource": default_resource_state(),
         "pending_state_reset_alert": flat["pending_state_reset_alert"],
         "pending_boot_alert": None,
         "current_week": counters[0],
@@ -528,17 +614,28 @@ def migrate_state(raw: Any, boot_id: str, now: datetime) -> dict[str, Any]:
             f"state schema {version} is newer than supported schema {SCHEMA_VERSION}"
         )
     if version == SCHEMA_VERSION:
-        # pending_boot_alert arrived after the first schema 3 build.
-        raw.setdefault("pending_boot_alert", None)
         return validate_state(raw)
+    if version == 3:
+        # Schema 4 adds the resource monitor's counters. The bump is what makes
+        # an older build stop with FutureSchemaError; it would otherwise take a
+        # resource:* target for corruption and reset the state.
+        # pending_boot_alert arrived after the first schema 3 build.
+        return validate_state(
+            {
+                "pending_boot_alert": None,
+                **raw,
+                "schema_version": SCHEMA_VERSION,
+                "resource": default_resource_state(),
+            }
+        )
     if version == 0:
         flat = _upgrade_schema0(raw, boot_id, now)
     elif version == 1:
         flat = _upgrade_schema1(raw)
     else:
         flat = raw
-    # Schema 3 nests the single BOINC incident under targets.boinc so that
-    # the process monitor can keep one independent incident per target.
+    # Since schema 3 the single BOINC incident is nested under targets.boinc so
+    # that the process monitor can keep one independent incident per target.
     return validate_state(_upgrade_flat(flat))
 
 
@@ -738,6 +835,13 @@ class Settings:
     proc_root: Path = Path("/proc")
     systemctl: str = "/usr/bin/systemctl"
     docker_socket: Path = Path("/var/run/docker.sock")
+    resource_cpu_max: float = 90.0
+    resource_memory_max: float = 90.0
+    resource_disk_max: float = 90.0
+    resource_disk_paths: tuple[str, ...] = ("/",)
+    resource_net_interface: str = ""
+    resource_net_tx_mbps: float = 30.0
+    resource_net_month_tx_gb: float = 8000.0
     alert_after_failures: int = 2
     reminder_hours: float = 12.0
     telegram_chat_id: str = ""
@@ -779,6 +883,17 @@ class Settings:
                 cpu_threshold=float(environ.get("CPU_THRESHOLD", "30")),
                 targets_file=Path(environ.get("TARGETS_FILE", "/etc/sentinel/targets")),
                 docker_socket=Path(environ.get("DOCKER_SOCKET", "/var/run/docker.sock")),
+                resource_cpu_max=float(environ.get("RESOURCE_CPU_MAX", "90")),
+                resource_memory_max=float(environ.get("RESOURCE_MEMORY_MAX", "90")),
+                resource_disk_max=float(environ.get("RESOURCE_DISK_MAX", "90")),
+                resource_disk_paths=tuple(
+                    os.path.normpath(part.strip())
+                    for part in environ.get("RESOURCE_DISK_PATHS", "/").split(",")
+                    if part.strip()
+                ),
+                resource_net_interface=environ.get("RESOURCE_NET_INTERFACE", "").strip(),
+                resource_net_tx_mbps=float(environ.get("RESOURCE_NET_TX_MBPS", "30")),
+                resource_net_month_tx_gb=float(environ.get("RESOURCE_NET_MONTH_TX_GB", "8000")),
                 alert_after_failures=int(environ.get("ALERT_AFTER_FAILURES", "2")),
                 reminder_hours=float(environ.get("REMINDER_HOURS", "12")),
                 telegram_chat_id=environ.get("TELEGRAM_CHAT_ID", "").strip(),
@@ -817,6 +932,8 @@ class Settings:
             raise ConfigError("RECOVER_COOLDOWN_HOURS must be positive")
         if not math.isfinite(self.recover_timeout) or self.recover_timeout <= 0:
             raise ConfigError("RECOVER_TIMEOUT must be positive")
+        if "resource" in self.monitors:
+            self._validate_resource_limits()
         if "boinc" not in self.monitors:
             return
         if not math.isfinite(self.sample_seconds) or self.sample_seconds <= 0:
@@ -825,6 +942,44 @@ class Settings:
             raise ConfigError("TOTAL_VCPUS must be positive")
         if not math.isfinite(self.cpu_threshold) or not 0 <= self.cpu_threshold <= 100:
             raise ConfigError("CPU_THRESHOLD must be between 0 and 100")
+
+    def _validate_resource_limits(self) -> None:
+        percents = {
+            "RESOURCE_CPU_MAX": self.resource_cpu_max,
+            "RESOURCE_MEMORY_MAX": self.resource_memory_max,
+            "RESOURCE_DISK_MAX": self.resource_disk_max,
+        }
+        amounts = {
+            "RESOURCE_NET_TX_MBPS": self.resource_net_tx_mbps,
+            "RESOURCE_NET_MONTH_TX_GB": self.resource_net_month_tx_gb,
+        }
+        for name, value in percents.items():
+            if not math.isfinite(value) or not 0 <= value <= 100:
+                raise ConfigError(f"{name} must be between 0 and 100 (0 turns it off)")
+        for name, value in amounts.items():
+            if not math.isfinite(value) or value < 0:
+                raise ConfigError(f"{name} must be 0 (off) or positive")
+        if not any(value > 0 for value in (*percents.values(), *amounts.values())):
+            raise ConfigError("SENTINEL_MONITOR has resource but every RESOURCE_* limit is 0")
+        if self.resource_disk_max > 0:
+            paths = self.resource_disk_paths
+            if not paths:
+                raise ConfigError("RESOURCE_DISK_PATHS needs at least one path")
+            if len(set(paths)) != len(paths):
+                raise ConfigError("RESOURCE_DISK_PATHS lists a path twice")
+            for disk_path in paths:
+                if not disk_path.startswith("/"):
+                    raise ConfigError(f"RESOURCE_DISK_PATHS must be absolute: {disk_path!r}")
+                if any(
+                    disk_path == hidden or disk_path.startswith(f"{hidden}/")
+                    for hidden in HIDDEN_DISK_PATHS
+                ):
+                    # statvfs() there would describe the tmpfs that stands in
+                    # for the directory, not the filesystem behind it.
+                    raise ConfigError(
+                        f"RESOURCE_DISK_PATHS cannot include {disk_path}: "
+                        "sentinel.service hides it with ProtectHome=yes"
+                    )
 
 
 class BoincProbe:
@@ -1435,6 +1590,377 @@ class DockerMonitor:
         return False, f"docker {action} HTTP {status}"
 
 
+PROBE_ERRORS = (OSError, ValueError, KeyError, IndexError)
+
+
+def read_cpu_times(proc_root: Path) -> tuple[int, int]:
+    """Busy and total CPU time in ticks, summed over every CPU since boot.
+
+    Busy is user, system and interrupt time. nice is left out: BOINC computes
+    at nice 19 and takes whatever is idle on purpose, so this is what everything
+    else uses. idle, iowait and steal are not this host's usage either.
+    """
+    with (proc_root / "stat").open(encoding="ascii") as handle:
+        fields = handle.readline().split()
+    if len(fields) < 9 or fields[0] != "cpu":
+        raise ValueError("unexpected /proc/stat")
+    user, nice, system, idle, iowait, irq, softirq, steal = (int(value) for value in fields[1:9])
+    busy = user + system + irq + softirq
+    return busy, busy + nice + idle + iowait + steal
+
+
+def cpu_percent(start: tuple[int, int], end: tuple[int, int]) -> Optional[float]:
+    """Busy share between two readings, None when the counters did not advance."""
+    busy, total = end[0] - start[0], end[1] - start[1]
+    if total <= 0 or not 0 <= busy <= total:
+        return None
+    return busy / total * 100
+
+
+def read_memory_kb(proc_root: Path) -> tuple[int, int]:
+    """MemAvailable and MemTotal from /proc/meminfo."""
+    values: dict[str, int] = {}
+    for line in (proc_root / "meminfo").read_text(encoding="ascii").splitlines():
+        key, _, rest = line.partition(":")
+        if key in ("MemAvailable", "MemTotal"):
+            values[key] = int(rest.split()[0])
+    if values["MemTotal"] <= 0:
+        raise ValueError("MemTotal is not positive")
+    return values["MemAvailable"], values["MemTotal"]
+
+
+def default_interface(proc_root: Path) -> Optional[str]:
+    """The interface of the IPv4 default route, the lowest metric first."""
+    best: Optional[tuple[int, str]] = None
+    lines = (proc_root / "net" / "route").read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in lines[1:]:
+        fields = line.split()
+        # Iface Destination Gateway Flags RefCnt Use Metric Mask; flag 1 is RTF_UP.
+        if len(fields) < 8 or fields[1] != "00000000" or fields[7] != "00000000":
+            continue
+        if not int(fields[3], 16) & 1:
+            continue
+        metric = int(fields[6])
+        if best is None or metric < best[0]:
+            best = (metric, fields[0])
+    return None if best is None else best[1]
+
+
+def read_tx_bytes(proc_root: Path, interface: str) -> Optional[int]:
+    """Bytes the interface sent since boot, None when /proc/net/dev lacks it."""
+    text = (proc_root / "net" / "dev").read_text(encoding="utf-8", errors="replace")
+    for line in text.splitlines():
+        name, separator, counters = line.partition(":")
+        if separator and name.strip() == interface:
+            # Eight receive fields come first.
+            return int(counters.split()[8])
+    return None
+
+
+def _stored_window(stored: Optional[dict[str, Any]], now: datetime) -> Optional[float]:
+    """Seconds from a stored reading to now, when that span can be averaged over.
+
+    None for a missing reading (first run, reboot), a clock that went
+    backwards, a rerun seconds later and a reading older than an hour.
+    """
+    taken = parse_utc(stored["sampled_at"]) if stored is not None else None
+    if taken is None:
+        return None
+    age = (now - taken).total_seconds()
+    return age if RESOURCE_SAMPLE_SECONDS <= age <= RESOURCE_WINDOW_MAX_SECONDS else None
+
+
+def restart_resource_counters(resource: dict[str, Any]) -> None:
+    """Forget what the kernel counters read before a reboot.
+
+    They all restart from zero. For traffic that means everything the
+    interface shows now was sent since boot, so the baseline becomes zero and
+    the month total keeps growing; only the time of that baseline is unknown.
+    """
+    resource["cpu"] = None
+    if resource["tx"] is not None:
+        resource["tx"]["bytes"] = 0
+        resource["tx"]["sampled_at"] = None
+
+
+def stored_resource_counters(path: Path, boot_id: str) -> dict[str, Any]:
+    """The counters the last run left, for check-config: read-only, best effort."""
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+        resource = raw["resource"]
+        _validate_resource(resource)
+    except (OSError, ValueError, KeyError, TypeError, InvalidStateError):
+        return default_resource_state()
+    if raw.get("boot_id") != boot_id:
+        restart_resource_counters(resource)
+    return resource
+
+
+@dataclass
+class _Average:
+    """A cumulative counter on its way to an average over some window."""
+
+    reading: Any = None  # This run's counter value, None when the read failed.
+    error: Optional[str] = None
+    value: Optional[float] = None  # None while no window is known.
+    window: Optional[float] = None  # Seconds the value covers.
+
+    @property
+    def needs_sample(self) -> bool:
+        return self.reading is not None and self.value is None
+
+
+def _resource_result(
+    target_id: str,
+    value: Optional[float],
+    limit: float,
+    details: dict[str, Any],
+    error: Optional[str],
+    label: str = "",
+    unit: str = "",
+    digits: int = 1,
+) -> TargetResult:
+    """Fail a resource target whose reading is missing or over its limit."""
+    hint = "resource targets only alert"
+    if error is not None or value is None:
+        return TargetResult(
+            target_id, [error or "no reading"], details, probe_ok=False, recovery_hint=hint
+        )
+    reasons = [f"{label} {value:.{digits}f}{unit} > {limit:g}{unit}"] if value > limit else []
+    return TargetResult(target_id, reasons, details, recovery_hint=hint)
+
+
+class ResourceMonitor:
+    """Option 4: host CPU, memory, disk and outbound traffic against limits.
+
+    Every limit is a setting and 0 turns its target off. The targets only
+    alert; nothing here could free a disk or stop a runaway process.
+
+    CPU and the transmit rate are averages over the time since the previous
+    run, taken from the cumulative kernel counters that run left in
+    state["resource"]. resume() hands those over and check() advances them in
+    place, so they are saved with the rest of the state. Without usable
+    counters (first run, reboot, a long gap) both are sampled inside the run.
+    """
+
+    name = "resource"
+
+    def __init__(
+        self,
+        settings: Settings,
+        statvfs: Callable[[str], Any] = os.statvfs,
+        sleeper: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+    ):
+        self.settings = settings
+        self.statvfs = statvfs
+        self.sleeper = sleeper
+        self.monotonic = monotonic
+        self.counters = default_resource_state()
+        self.now: Optional[datetime] = None
+
+    def target_ids(self) -> list[str]:
+        settings = self.settings
+        target_ids: list[str] = []
+        if settings.resource_cpu_max > 0:
+            target_ids.append("resource:cpu")
+        if settings.resource_memory_max > 0:
+            target_ids.append("resource:memory")
+        if settings.resource_disk_max > 0:
+            target_ids.extend(f"resource:disk:{path}" for path in settings.resource_disk_paths)
+        if settings.resource_net_tx_mbps > 0:
+            target_ids.append("resource:tx-rate")
+        if settings.resource_net_month_tx_gb > 0:
+            target_ids.append(TX_MONTH_TARGET)
+        return target_ids
+
+    def resume(self, counters: dict[str, Any], now: datetime) -> None:
+        """Take the previous run's counters; check() advances them in place."""
+        self.counters = counters
+        self.now = now
+
+    def _cpu_times(self) -> tuple[Optional[tuple[int, int]], Optional[str]]:
+        try:
+            return read_cpu_times(self.settings.proc_root), None
+        except PROBE_ERRORS as exc:
+            return None, f"CPU query {type(exc).__name__}"
+
+    def _tx_bytes(
+        self, interface: Optional[str] = None
+    ) -> tuple[Optional[str], Optional[int], Optional[str]]:
+        """The interface, its transmit counter and what went wrong, if anything."""
+        proc_root = self.settings.proc_root
+        try:
+            if not interface:
+                interface = self.settings.resource_net_interface or default_interface(proc_root)
+            if not interface:
+                return None, None, "no default route; set RESOURCE_NET_INTERFACE"
+            sent = read_tx_bytes(proc_root, interface)
+        except PROBE_ERRORS as exc:
+            return interface, None, f"network query {type(exc).__name__}"
+        if sent is None:
+            return interface, None, f"interface {interface} not found"
+        return interface, sent, None
+
+    def _begin_cpu(self, now: datetime) -> _Average:
+        reading, error = self._cpu_times()
+        average = _Average(reading, error)
+        if reading is None:
+            # The stored counters stay, so the next run averages across this one.
+            return average
+        stored = self.counters["cpu"]
+        window = _stored_window(stored, now)
+        if window is not None:
+            average.value = cpu_percent((stored["busy"], stored["total"]), reading)
+            average.window = window
+        self.counters["cpu"] = {"sampled_at": utc_text(now), "busy": reading[0], "total": reading[1]}
+        return average
+
+    def _begin_tx(self, now: datetime) -> tuple[_Average, Optional[str]]:
+        interface, reading, error = self._tx_bytes()
+        average = _Average(reading, error)
+        if reading is None:
+            return average, interface
+        counters = self.counters
+        month = now.astimezone(timezone.utc).strftime("%Y-%m")
+        if counters["tx_month"] is None or counters["tx_month"]["month"] != month:
+            counters["tx_month"] = {"month": month, "bytes": 0}
+        stored = counters["tx"]
+        # A first reading, another interface or a counter that went backwards
+        # (the interface was recreated) only sets the baseline.
+        if stored is not None and stored["interface"] == interface and reading >= stored["bytes"]:
+            sent = reading - stored["bytes"]
+            counters["tx_month"]["bytes"] += sent
+            window = _stored_window(stored, now)
+            if window is not None:
+                average.value = sent * 8 / window / 1_000_000
+                average.window = window
+        counters["tx"] = {"sampled_at": utc_text(now), "interface": interface, "bytes": reading}
+        return average, interface
+
+    def _check_memory(self) -> TargetResult:
+        limit = self.settings.resource_memory_max
+        details: dict[str, Any] = {
+            "percent": None, "limit": limit, "available_mib": None, "total_mib": None
+        }
+        try:
+            available, total = read_memory_kb(self.settings.proc_root)
+        except PROBE_ERRORS as exc:
+            return _resource_result(
+                "resource:memory", None, limit, details, f"memory query {type(exc).__name__}"
+            )
+        # lxcfs has reported more available than total; keep the reading in range.
+        percent = round(max(total - available, 0) / total * 100, 1)
+        details.update(percent=percent, available_mib=available // 1024, total_mib=total // 1024)
+        return _resource_result("resource:memory", percent, limit, details, None, "memory", "%")
+
+    def _check_disk(self, path: str) -> TargetResult:
+        limit = self.settings.resource_disk_max
+        target_id = f"resource:disk:{path}"
+        details: dict[str, Any] = {"percent": None, "limit": limit, "free_gib": None, "total_gib": None}
+        try:
+            stats = self.statvfs(path)
+            used = stats.f_blocks - stats.f_bfree
+            # The same figure as df: used space against what an unprivileged
+            # writer can use, which leaves out the root-reserved blocks.
+            usable = used + stats.f_bavail
+            if usable <= 0:
+                raise ValueError("filesystem has no blocks")
+        except PROBE_ERRORS as exc:
+            return _resource_result(
+                target_id, None, limit, details, f"disk query {type(exc).__name__}"
+            )
+        percent = round(used / usable * 100, 1)
+        gib = stats.f_frsize / 1024**3
+        details.update(
+            percent=percent,
+            free_gib=round(stats.f_bavail * gib, 1),
+            total_gib=round(stats.f_blocks * gib, 1),
+        )
+        return _resource_result(target_id, percent, limit, details, None, "disk", "%")
+
+    def check(self) -> list[TargetResult]:
+        settings = self.settings
+        now = self.now if self.now is not None else utc_now()
+        watch_rate = settings.resource_net_tx_mbps > 0
+        watch_month = settings.resource_net_month_tx_gb > 0
+
+        # Both counters are read before the wait, so one wait serves both.
+        cpu = self._begin_cpu(now) if settings.resource_cpu_max > 0 else None
+        tx, interface = self._begin_tx(now) if watch_rate or watch_month else (None, None)
+        # The month total stands on the first reading alone.
+        month_error = tx.error if tx is not None else None
+        sample_cpu = cpu is not None and cpu.needs_sample
+        sample_tx = watch_rate and tx is not None and tx.needs_sample
+        if sample_cpu or sample_tx:
+            started = self.monotonic()
+            self.sleeper(RESOURCE_SAMPLE_SECONDS)
+            elapsed = max(self.monotonic() - started, 0.001)
+            if sample_cpu:
+                later, cpu.error = self._cpu_times()
+                if later is not None:
+                    cpu.value, cpu.window = cpu_percent(cpu.reading, later), elapsed
+                    if cpu.value is None:
+                        cpu.error = "CPU counters did not advance"
+            if sample_tx:
+                _, sent, tx.error = self._tx_bytes(interface)
+                if sent is not None:
+                    tx.value = max(sent - tx.reading, 0) * 8 / elapsed / 1_000_000
+                    tx.window = elapsed
+
+        results: list[TargetResult] = []
+        if cpu is not None:
+            percent = None if cpu.value is None else round(cpu.value, 1)
+            details: dict[str, Any] = {
+                "percent": percent,
+                "limit": settings.resource_cpu_max,
+                "window_seconds": None if cpu.window is None else round(cpu.window),
+            }
+            results.append(
+                _resource_result(
+                    "resource:cpu", percent, settings.resource_cpu_max, details, cpu.error, "CPU", "%"
+                )
+            )
+        if settings.resource_memory_max > 0:
+            results.append(self._check_memory())
+        if settings.resource_disk_max > 0:
+            results.extend(self._check_disk(path) for path in settings.resource_disk_paths)
+        if watch_rate:
+            mbps = None if tx.value is None else round(tx.value, 3)
+            details = {
+                "mbps": mbps,
+                "limit": settings.resource_net_tx_mbps,
+                "window_seconds": None if tx.window is None else round(tx.window),
+                "interface": interface,
+            }
+            results.append(
+                _resource_result(
+                    "resource:tx-rate", mbps, settings.resource_net_tx_mbps, details, tx.error,
+                    "TX", "Mbps", 2,
+                )
+            )
+        if watch_month:
+            total = self.counters["tx_month"]
+            sent_gb = None if tx.reading is None else round(total["bytes"] / 1_000_000_000, 3)
+            details = {
+                "gb": sent_gb,
+                "limit": settings.resource_net_month_tx_gb,
+                "month": None if tx.reading is None else total["month"],
+                "interface": interface,
+            }
+            results.append(
+                _resource_result(
+                    TX_MONTH_TARGET, sent_gb, settings.resource_net_month_tx_gb, details, month_error,
+                    "month TX", "GB", 1,
+                )
+            )
+        return results
+
+    def recover(self, target_id: str) -> tuple[bool, str]:
+        return False, "no recovery action"
+
+
 class TelegramNotifier:
     def __init__(self, chat_id: str, token_file: Optional[Path], timeout: float = 10.0):
         self.chat_id = chat_id
@@ -1509,6 +2035,7 @@ def handle_boot_change(
         target["recoveries_this_incident"] = 0
         # Every service and process starts over on boot; that is not a restart.
         target["restart_marker"] = None
+    restart_resource_counters(state["resource"])
     LOGGER.info("boot ID changed previous=%s current=%s failure_streak_reset=true", previous, boot_id)
     return True
 
@@ -1660,6 +2187,44 @@ def _show(value: Any) -> str:
     return "?" if value is None else str(value)
 
 
+def _fixed(value: Any, digits: int) -> str:
+    return "?" if value is None else f"{value:.{digits}f}"
+
+
+def _window_label(seconds: Any) -> str:
+    if seconds is None:
+        return "?"
+    return f"{round(seconds / 60)}분" if seconds >= 90 else f"{round(seconds)}초"
+
+
+def _resource_summary(target_id: str, details: dict[str, Any]) -> str:
+    metric = resource_metric(target_id)
+    if metric == "cpu":
+        return (
+            f"CPU={_fixed(details.get('percent'), 1)}% "
+            f"(nice 제외, {_window_label(details.get('window_seconds'))} 평균)"
+        )
+    if metric == "memory":
+        return (
+            f"메모리={_fixed(details.get('percent'), 1)}% "
+            f"(가용 {_show(details.get('available_mib'))}MiB/{_show(details.get('total_mib'))}MiB)"
+        )
+    if metric == "disk":
+        return (
+            f"디스크={_fixed(details.get('percent'), 1)}% "
+            f"(여유 {_fixed(details.get('free_gib'), 1)}GiB/{_fixed(details.get('total_gib'), 1)}GiB)"
+        )
+    if metric == "tx-rate":
+        return (
+            f"송신={_fixed(details.get('mbps'), 2)}Mbps "
+            f"({_show(details.get('interface'))}, {_window_label(details.get('window_seconds'))} 평균)"
+        )
+    return (
+        f"이번 달 송신={_fixed(details.get('gb'), 1)}GB "
+        f"({_show(details.get('month'))}, {_show(details.get('interface'))})"
+    )
+
+
 def _last_check_summary(target_id: str, target: dict[str, Any]) -> str:
     check = target["last_check"]
     if check is None:
@@ -1685,6 +2250,8 @@ def _last_check_summary(target_id: str, target: dict[str, Any]) -> str:
             f"Status={_show(details.get('status'))}, Health={health}, "
             f"RestartCount={_show(details.get('restart_count'))}, 원인={reasons}"
         )
+    if kind == "resource":
+        return f"{_resource_summary(target_id, details)}, 원인={reasons}"
     return f"프로세스={details['count']}개, 원인={reasons}"
 
 
@@ -1828,6 +2395,13 @@ def pending_notifications(
             ]
             if unhealthy:
                 message += f"; 장애 대상={', '.join(unhealthy)}"
+            month = state["targets"].get(TX_MONTH_TARGET)
+            if month is not None and month["last_check"] is not None:
+                details = month["last_check"]["details"]
+                message += (
+                    f"; 이번 달 송신={_fixed(details.get('gb'), 1)}GB"
+                    f"/기준 {_fixed(details.get('limit'), 0)}GB"
+                )
         notifications.append(Notification("weekly", message))
     return notifications
 
@@ -1917,6 +2491,7 @@ class Sentinel:
         rotate_week(state, now)
         sync_targets(state, self.monitor.name, self.monitor.target_ids())
 
+        resume_monitor(self.monitor, state["resource"], now)
         results = self.monitor.check()
         state["current_week"]["checks"] += 1
         for result in results:
@@ -1985,6 +2560,14 @@ class CompositeMonitor:
         return self.owners[target_id].recover(target_id)
 
 
+def resume_monitor(monitor: Any, resource: dict[str, Any], now: datetime) -> None:
+    """Hand the counters kept between runs to the monitor that averages over them."""
+    members = monitor.monitors if isinstance(monitor, CompositeMonitor) else [monitor]
+    for member in members:
+        if isinstance(member, ResourceMonitor):
+            member.resume(resource, now)
+
+
 def build_monitor(settings: Settings) -> Any:
     parts = settings.monitors
     monitors: list[Any] = []
@@ -2005,6 +2588,8 @@ def build_monitor(settings: Settings) -> Any:
             monitors.append(
                 DockerMonitor(settings, own) if part == "docker" else ProcessMonitor(settings, own)
             )
+    if "resource" in parts:
+        monitors.append(ResourceMonitor(settings))
     if len(monitors) == 1:
         return monitors[0]
     return CompositeMonitor(settings.monitor, monitors)
@@ -2020,8 +2605,18 @@ def build_sentinel(settings: Settings) -> Sentinel:
     )
 
 
-def check_config(settings: Settings, monitor: Any, out: Callable[[str], None] = print) -> int:
+def check_config(
+    settings: Settings,
+    monitor: Any,
+    out: Callable[[str], None] = print,
+    boot_id_reader: Callable[[], str] = read_boot_id,
+    now: Optional[datetime] = None,
+) -> int:
     """Print each target's current status without touching the state file."""
+    if "resource" in settings.monitors:
+        # The averages start at the last run's counters; nothing is written back.
+        counters = stored_resource_counters(settings.state_file, boot_id_reader())
+        resume_monitor(monitor, counters, now or utc_now())
     out(f"monitor={monitor.name} targets={len(monitor.target_ids())}")
     for result in monitor.check():
         status = "ok  " if result.healthy else "FAIL"

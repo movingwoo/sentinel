@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: install.sh [--monitor boinc|process|docker[,...]]" >&2
+    echo "usage: install.sh [--monitor boinc|process|docker|resource[,...]]" >&2
     exit 2
 }
 
@@ -43,7 +43,7 @@ conf_value() {
 }
 
 # Canonicalize a comma-separated monitor list the way sentinel does: known
-# names deduplicated in boinc,process,docker order. Unknown names fail.
+# names deduplicated in boinc,process,docker,resource order. Unknown names fail.
 normalize_monitor() {
     local part result="" name
     local -a parts
@@ -52,11 +52,11 @@ normalize_monitor() {
     for part in "${parts[@]}"; do
         [[ -n ${part} ]] || continue
         case "${part}" in
-            boinc|process|docker) seen[${part}]=1 ;;
+            boinc|process|docker|resource) seen[${part}]=1 ;;
             *) echo "unknown monitor: ${part}" >&2; return 1 ;;
         esac
     done
-    for name in boinc process docker; do
+    for name in boinc process docker resource; do
         [[ -n ${seen[${name}]:-} ]] && result+=${result:+,}${name}
     done
     printf '%s\n' "${result}"
@@ -82,12 +82,15 @@ if [[ -z ${monitor} ]]; then
         echo "  2) services/processes"
         echo "  3) Docker containers"
         echo "  4) BOINC and services/processes"
+        echo "  5) host resources (CPU, memory, disk, outbound traffic)"
+        echo "Other combinations: install.sh --monitor boinc,process,resource"
         read -r -p "choice [1]: " choice
         case "${choice:-1}" in
             1) monitor=boinc ;;
             2) monitor=process ;;
             3) monitor=docker ;;
             4) monitor=boinc,process ;;
+            5) monitor=resource ;;
             *) echo "invalid choice: ${choice}" >&2; exit 2 ;;
         esac
     else
@@ -148,14 +151,14 @@ if has_monitor boinc; then
     install -D -m 0644 "${source_dir}/systemd/sentinel.service.d/boinc.conf" \
         "${service_dropins}/boinc.conf"
 fi
+# The 5 minute timer suits services, containers and resources, but BOINC keeps
+# its 15 minutes when combined: a denser schedule is likelier to catch the
+# brief gap between two tasks as starvation and run the destructive sync.
+if ! has_monitor boinc; then
+    install -D -m 0644 "${source_dir}/systemd/sentinel.timer.d/interval.conf" \
+        "${timer_dropins}/interval.conf"
+fi
 if has_monitor process || has_monitor docker; then
-    # The 5 minute timer suits services and containers, but BOINC keeps its
-    # 15 minutes when combined: a denser schedule is likelier to catch the
-    # brief gap between two tasks as starvation and run the destructive sync.
-    if ! has_monitor boinc; then
-        install -D -m 0644 "${source_dir}/systemd/sentinel.timer.d/interval.conf" \
-            "${timer_dropins}/interval.conf"
-    fi
     if has_monitor docker; then
         install -D -m 0644 "${source_dir}/systemd/sentinel.service.d/docker.conf" \
             "${service_dropins}/docker.conf"
@@ -200,7 +203,7 @@ systemctl daemon-reload
 if [[ ${monitor} != boinc ]]; then
     # sentinel reads sentinel.conf itself when started from a shell.
     if ! /usr/local/sbin/sentinel check-config; then
-        echo "check-config failed. Fix ${targets}, then rerun install.sh" >&2
+        echo "check-config failed. Fix ${targets} or ${conf}, then rerun install.sh" >&2
         echo "or check with: sudo /usr/local/sbin/sentinel check-config" >&2
         exit 1
     fi
